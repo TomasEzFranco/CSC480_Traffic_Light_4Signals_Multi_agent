@@ -15,6 +15,11 @@ import threading
 import pygame
 import sys
 import matplotlib.pyplot as plt
+import torch
+import csv
+import torch.nn as nn
+import collections
+import numpy as np
 
 # -----------------------------
 # Reproducibility
@@ -25,7 +30,7 @@ random.seed(RNG_SEED)
 # -----------------------------
 # Simulation settings
 # -----------------------------
-simulationTime = 60   # seconds
+simulationTime = 240  #60  # seconds
 
 # Two-phase controller settings
 MIN_GREEN = 8         # minimum seconds green must stay before allowing a switch
@@ -92,6 +97,9 @@ simulation = pygame.sprite.Group()
 
 # Global flag
 stop_simulation = False
+
+#Going to create a CSV file
+LOG_PATH = "supervised_data.csv"
 
 # -----------------------------
 # Spawn helpers (fixed spawn positions)
@@ -206,6 +214,36 @@ def plot_metrics(title="Run"):
     plt.tight_layout()
     plt.savefig("signal_state.png")
 
+
+ #Classes for the Reinforcment learning agent
+class ReplayBuffer:
+    def __init__(self, capacity=50_000):
+        self.buf = collections.deque(maxlen=capacity)
+
+    def push(self, s, a, r, s2, done):
+        self.buf.append((s, a, r, s2, done))
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buf, batch_size)
+        s, a, r, s2, d = map(np.array, zip(*batch))
+        return s, a, r, s2, d
+
+    def __len__(self):
+        return len(self.buf)
+
+
+class DQN(nn.Module):
+    def __init__(self, obs_dim=6, n_actions=2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, 64), nn.ReLU(),
+            nn.Linear(64, 64), nn.ReLU(),
+            nn.Linear(64, n_actions),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
 # -----------------------------
 # Agents
 # -----------------------------
@@ -213,6 +251,158 @@ class Agent:
     def act(self, queues, phase, in_yellow, green_elapsed):
         """Return True to request a switch (controller enforces MIN_GREEN)."""
         return False
+
+class RLAgent(Agent):
+    """
+    Online DQN trainer + acting policy.
+    Uses your existing act() hook (called once per second).
+    """
+    def __init__(self, obs_dim=6, n_actions=2, device="cpu"):
+        self.device = torch.device(device)
+        self.prev_switch = 0
+
+        self.q = DQN(obs_dim, n_actions).to(self.device)
+        self.q_tgt = DQN(obs_dim, n_actions).to(self.device)
+        self.q_tgt.load_state_dict(self.q.state_dict())
+
+        self.optim = torch.optim.Adam(self.q.parameters(), lr=1e-3)
+        self.buf = ReplayBuffer(100_000)
+
+        self.gamma = 0.99
+        self.batch_size = 256
+        self.learn_every = 4          # gradient step frequency (seconds)
+        self.target_sync_every = 500  # seconds
+
+        self.eps = 1.0
+        self.eps_min = 0.05
+        self.eps_decay = 0.9995
+
+        # To store last transition pieces
+        self.prev_state = None
+        self.prev_action = None
+
+        self.t = 0
+
+        # normalization constants (match your NeuralAgent)
+        self.MAX_Q = 20.0
+        self.MAX_T = 30.0
+
+    def _make_state(self, queues, phase, green_elapsed):
+        return np.array([
+            queues['down'] / self.MAX_Q,
+            queues['up'] / self.MAX_Q,
+            queues['right'] / self.MAX_Q,
+            queues['left'] / self.MAX_Q,
+            float(phase),
+            min(green_elapsed, self.MAX_T) / self.MAX_T
+        ], dtype=np.float32)
+
+    def _valid_actions_mask(self, in_yellow, green_elapsed):
+        # action 1 (request switch) is only meaningful if NOT in_yellow and green_elapsed >= MIN_GREEN
+        mask = np.ones(2, dtype=np.bool_)
+        if in_yellow or green_elapsed < MIN_GREEN:
+            mask[1] = False
+        return mask
+
+    def _select_action(self, state, valid_mask):
+        # epsilon-greedy with invalid-action masking
+        if random.random() < self.eps:
+            valid_actions = np.where(valid_mask)[0]
+            return int(random.choice(valid_actions))
+
+        with torch.no_grad():
+            s = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+            qvals = self.q(s).squeeze(0).cpu().numpy()
+            qvals[~valid_mask] = -1e9
+            return int(np.argmax(qvals))
+
+    def observe_and_learn(self, reward, next_state, done):
+        self.t += 1
+        # store transition from previous step
+        if self.prev_state is not None and self.prev_action is not None:
+            self.buf.push(self.prev_state, self.prev_action, reward, next_state, done)
+
+        # learn
+        if len(self.buf) >= self.batch_size and (self.t % self.learn_every == 0):
+            s, a, r, s2, d = self.buf.sample(self.batch_size)
+
+            s = torch.tensor(s, dtype=torch.float32, device=self.device)
+            a = torch.tensor(a, dtype=torch.int64, device=self.device)
+            r = torch.tensor(r, dtype=torch.float32, device=self.device)
+            s2 = torch.tensor(s2, dtype=torch.float32, device=self.device)
+            d = torch.tensor(d, dtype=torch.float32, device=self.device)
+
+            q_sa = self.q(s).gather(1, a.view(-1, 1)).squeeze(1)
+            with torch.no_grad():
+                # Double DQN optional; this is standard DQN target
+                max_q_next = self.q_tgt(s2).max(dim=1)[0]
+                target = r + self.gamma * (1.0 - d) * max_q_next
+
+            loss = torch.mean((q_sa - target) ** 2)
+
+            self.optim.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.q.parameters(), 5.0)
+            self.optim.step()
+
+        # sync target net
+        if self.t % self.target_sync_every == 0:
+            self.q_tgt.load_state_dict(self.q.state_dict())
+
+        # decay epsilon
+        self.eps = max(self.eps_min, self.eps * self.eps_decay)
+
+    def act(self, queues, phase, in_yellow, green_elapsed):
+        state = self._make_state(queues, phase, green_elapsed)
+        valid_mask = self._valid_actions_mask(in_yellow, green_elapsed)
+        action = self._select_action(state, valid_mask)
+        self.prev_switch = int(action == 1)
+
+        # save for next transition
+        self.prev_state = state
+        self.prev_action = action
+
+        # return "request_switch" boolean
+        return (action == 1)
+
+class NeuralAgent(Agent):
+    def __init__(self, model):
+        self.model = model
+        self.model.eval()
+
+    def act(self, queues, phase, in_yellow, green_elapsed):
+        if in_yellow:
+            return False
+        
+        MAX_Q = 20.0
+        MAX_T = 30.0
+
+        x = torch.tensor([
+            queues['down'] / MAX_Q,
+            queues['up'] / MAX_Q, 
+            queues['right'] / MAX_Q, 
+            queues['left'] / MAX_Q,
+            float(phase),
+            min(green_elapsed, MAX_T) / MAX_T
+        ], dtype=torch.float32).unsqueeze(0)
+
+        device = next(self.model.parameters()).device
+        x = x.to(device)
+
+        with torch.no_grad():
+            out = self.model(x)
+
+            if out.ndim == 2 and out.shape[1] == 2:
+                decision = int(torch.argmax(out, dim=1).item())
+                return (decision == 0)   # interpret class 0 as "switch"
+            
+            if out.numel() == 1:
+                probs = torch.softmax(out, dim=1)
+                p_switch = probs[0, 1].item()     # assumes index 1 is "switch"
+                return p_switch > 0.5
+            
+            raise ValueError(f"Unexpected model output shape: {tuple(out.shape)}")
+
 
 class ReflexQueueAgent(Agent):
     def __init__(self, threshold=6, max_hold=25):
@@ -313,14 +503,30 @@ class WaitTimeAgent(Agent):
         return False
 
 
-# pick agent type here: "reflex", "fixed", "pressure", "wait"
-AGENT_TYPE = "reflex"
+# pick agent type here: "reflex", "fixed", "pressure", "wait", "neural"
+AGENT_TYPE = "fixed"
 if AGENT_TYPE == "fixed":
     agent = FixedTimeAgent(fixed_green=12)
 elif AGENT_TYPE == "reflex":
     agent = ReflexQueueAgent(threshold=6, max_hold=25)
 elif AGENT_TYPE == "pressure":
     agent = MaxPressureAgent(margin=2)
+elif AGENT_TYPE == "neural":
+    def make_model():
+        return nn.Sequential(
+            nn.Linear(6, 32), nn.ReLU(),
+            nn.Linear(32, 32), nn.ReLU(),
+            nn.Linear(32, 2)
+        )
+    
+    model = make_model()
+    state_dict = torch.load("basic_changes_jeremy/model_supervised.pt", map_location="cpu")
+    model.load_state_dict(state_dict)
+
+    agent = NeuralAgent(model)
+elif AGENT_TYPE == "rl":
+    agent = RLAgent(obs_dim=6, n_actions=2, device="cpu")
+
 else:
     agent = WaitTimeAgent(max_wait_margin=5, max_hold=30)
 
@@ -633,11 +839,17 @@ def summarize():
         "throughput_per_switch_req": (total_thr / switches) if switches else float("inf"),
     }
 
+prev_total_q = None
+
 # -----------------------------
 # Main
 # -----------------------------
 def main():
     global vehicles_removed_this_second
+
+    log_f = open(LOG_PATH, "a", newline="")
+    log_writer = csv.writer(log_f)
+
     black = (0, 0, 0)
     white = (255, 255, 255)
     screen = pygame.display.set_mode((screenWidth, screenHeight))
@@ -657,32 +869,82 @@ def main():
         if stop_simulation:
             showStats()
             plot_metrics(title=agent.__class__.__name__)
+            log_f.close()
             pygame.quit()
             sys.exit()
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 showStats()
                 plot_metrics(title=agent.__class__.__name__)
+                log_f.close()
+                pygame.quit()
                 sys.exit()
         # 1-second controller update + metrics
         while decision_accum >= 1.0:
             decision_accum -= 1.0
+
+            # Observe (state at start of this 1s decision)
             q = get_queues()
-            request_switch = agent.act(q, phase, in_yellow, green_elapsed)
-            signal_step(request_switch)
             ns_q = q['down'] + q['up']
             ew_q = q['right'] + q['left']
             total_q = ns_q + ew_q
+
+            # Compute dq for reward shaping (queue improvement)
+            global prev_total_q
+            if prev_total_q is None:
+                dq = 0.0
+            else:
+                dq = float(prev_total_q - total_q)  # positive if queue got smaller
+            prev_total_q = total_q
+
+            # Choose action for THIS second
+            request_switch = agent.act(q, phase, in_yellow, green_elapsed)
+
+            MAX_GREEN = 35
+            if (not in_yellow) and (green_elapsed >= MAX_GREEN):
+                request_switch = True
+
+            # Capture "before"
+            phase_before = phase
+            green_before = green_elapsed
+            in_yellow_before = in_yellow
+
+            # Apply the action ONCE (this updates in_yellow/phase/green_elapsed)
+            signal_step(request_switch)
+
+            # Now we can tell whether we ENTERED yellow this second
+            entered_yellow = (not in_yellow_before) and in_yellow
+
+            # RL: finish previous transition using this observation as next_state
+            if isinstance(agent, RLAgent):
+                next_state = agent._make_state(q, phase_before, green_before)
+                reward = dq + 0.5 * float(vehicles_removed_this_second) - 1.0 * float(entered_yellow)
+                done = bool(stop_simulation)
+                agent.observe_and_learn(reward, next_state, done)
+
+            # Log consistent (state_t, action_t)
+            log_writer.writerow([
+                q["down"], q["up"], q["right"], q["left"],
+                phase_before, green_before,
+                int(request_switch)
+            ])
+
+            # Metrics (you can choose before/after; just be consistent)
             t_now = len(metrics["t"])
             metrics["t"].append(t_now)
             metrics["ns_q"].append(ns_q)
             metrics["ew_q"].append(ew_q)
             metrics["total_q"].append(total_q)
-            metrics["phase"].append(phase)
-            metrics["in_yellow"].append(int(in_yellow))
+            metrics["phase"].append(phase_before)          # <- I recommend BEFORE for interpretability
+            metrics["in_yellow"].append(int(in_yellow_before))
             metrics["switch_req"].append(int(request_switch))
             metrics["throughput"].append(vehicles_removed_this_second)
+
             vehicles_removed_this_second = 0
+
+            if AGENT_TYPE == "neural":
+                print("q=", q, "phase=", phase, "green_elapsed=", green_elapsed, "req=", request_switch)
+
         # Rendering
         screen.blit(background, (0, 0))
         for i in range(4):
