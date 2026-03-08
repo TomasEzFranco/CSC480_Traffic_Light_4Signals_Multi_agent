@@ -5,14 +5,13 @@
 
 import random
 import time
-import threading
 import sys
 import os
 import csv
 import math
 import argparse
-import collections
-from datetime import datetime
+import json
+from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -20,12 +19,24 @@ from datetime import datetime
 parser = argparse.ArgumentParser(description="CSC 480 Traffic Simulation")
 parser.add_argument("--headless",   action="store_true")
 parser.add_argument("--mode",       default="adaptive",
-                    choices=["fixed", "adaptive", "greedy", "random"])
+                    choices=["fixed", "adaptive", "greedy", "random", "rl"])
 parser.add_argument("--seed",       type=int,   default=42)
 parser.add_argument("--duration",   type=int,   default=0)
 parser.add_argument("--spawn-rate", type=float, default=1.0)
 parser.add_argument("--log",        default="metrics.csv")
 parser.add_argument("--no-log",     action="store_true")
+parser.add_argument("--legacy-log", action="store_true")
+parser.add_argument("--dt",         type=float, default=1.0 / 60.0)
+parser.add_argument("--results-dir", default="results")
+parser.add_argument("--experiment-id", default="")
+parser.add_argument("--run-id",       default="")
+parser.add_argument("--rl-model-path", default="models/rl_qtable.json")
+parser.add_argument("--rl-train", action="store_true")
+parser.add_argument("--rl-alpha", type=float, default=0.2)
+parser.add_argument("--rl-gamma", type=float, default=0.95)
+parser.add_argument("--rl-epsilon", type=float, default=0.20)
+parser.add_argument("--rl-epsilon-min", type=float, default=0.02)
+parser.add_argument("--rl-epsilon-decay", type=float, default=0.9995)
 args = parser.parse_args()
 
 HEADLESS = args.headless
@@ -72,11 +83,23 @@ class Config:
     # HUD
     HUD_WIDTH        = 310
     FPS              = 60
+    FIXED_DT         = max(args.dt, 1e-3)
 
     # Metrics
     METRIC_INTERVAL  = 5.0
     LOG_FILE         = args.log
     DISABLE_LOG      = args.no_log
+    LEGACY_LOG       = args.legacy_log
+    RESULTS_DIR      = args.results_dir
+    EXPERIMENT_ID    = args.experiment_id.strip()
+    RUN_ID           = args.run_id.strip()
+    RL_MODEL_PATH    = args.rl_model_path
+    RL_TRAIN         = args.rl_train
+    RL_ALPHA         = args.rl_alpha
+    RL_GAMMA         = args.rl_gamma
+    RL_EPSILON       = args.rl_epsilon
+    RL_EPSILON_MIN   = args.rl_epsilon_min
+    RL_EPSILON_DECAY = args.rl_epsilon_decay
 
     # Run params
     SEED             = args.seed
@@ -143,7 +166,7 @@ class Config:
     ADAPTIVE_STARVATION_T = 45
 
 C = Config()
-random.seed(C.SEED)
+RNG = random.Random(C.SEED)
 
 # =============================================================================
 # IMAGE CACHE
@@ -170,64 +193,169 @@ def load_image(path: str) -> pygame.Surface:
     return surf
 
 # =============================================================================
+# RUN ARTIFACTS
+# =============================================================================
+class RunArtifacts:
+    def __init__(self):
+        exp = C.EXPERIMENT_ID or datetime.now(timezone.utc).strftime("exp_%Y%m%d_%H%M%S")
+        run = C.RUN_ID or f"{C.CONTROL_MODE}_seed{C.SEED}_spawn{C.SPAWN_RATE:.2f}".replace(".", "p")
+        self.experiment_id = exp
+        self.run_id = run
+        self.experiment_dir = os.path.join(C.RESULTS_DIR, exp)
+        self.run_dir = os.path.join(self.experiment_dir, run)
+        os.makedirs(self.run_dir, exist_ok=True)
+
+        self.timeseries_path = os.path.join(self.run_dir, "intersection_timeseries.csv")
+        self.summary_path = os.path.join(self.run_dir, "summary.json")
+        self.config_path = os.path.join(self.run_dir, "config.json")
+
+    def write_config(self):
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "mode": C.CONTROL_MODE,
+                "seed": C.SEED,
+                "spawn_rate": C.SPAWN_RATE,
+                "duration_s": C.DURATION,
+                "fixed_dt_s": C.FIXED_DT,
+                "headless": HEADLESS,
+                "rl_model_path": C.RL_MODEL_PATH,
+                "rl_train": C.RL_TRAIN,
+                "rl_alpha": C.RL_ALPHA,
+                "rl_gamma": C.RL_GAMMA,
+                "rl_epsilon": C.RL_EPSILON,
+                "rl_epsilon_min": C.RL_EPSILON_MIN,
+                "rl_epsilon_decay": C.RL_EPSILON_DECAY,
+                "grid_rows": C.GRID_ROWS,
+                "grid_cols": C.GRID_COLS,
+                "run_id": self.run_id,
+                "experiment_id": self.experiment_id,
+                "created_utc": datetime.now(timezone.utc).isoformat(),
+            }, f, indent=2)
+
+    def write_summary(self, summary):
+        with open(self.summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+
+# =============================================================================
 # METRICS ENGINE
 # =============================================================================
 class MetricsEngine:
-    def __init__(self):
-        self.start_time         = time.time()
-        self.last_log_time      = self.start_time
+    def __init__(self, artifacts: RunArtifacts):
+        self.artifacts          = artifacts
+        self.start_time         = 0.0
+        self.last_log_time      = 0.0
         self.total_crossed      = [0] * C.NO_INTERSECTIONS
         self.total_spawned      = [0] * C.NO_INTERSECTIONS
-        self.wait_samples       = [collections.deque(maxlen=500)
-                                   for _ in range(C.NO_INTERSECTIONS)]
-        self.queue_history      = [collections.deque(maxlen=300)
-                                   for _ in range(C.NO_INTERSECTIONS)]
-        self.vehicle_entry_time = {}
+        self.external_spawned   = [0] * C.NO_INTERSECTIONS
+        self.transferred_in     = [0] * C.NO_INTERSECTIONS
+        self.exited_world       = [0] * C.NO_INTERSECTIONS
+        self.red_violations     = [0] * C.NO_INTERSECTIONS
+        self.wait_samples       = [[] for _ in range(C.NO_INTERSECTIONS)]
+        self.wait_samples_by_dir = [
+            {d: [] for d in C.DIRECTION_NUMS.values()}
+            for _ in range(C.NO_INTERSECTIONS)
+        ]
+        self.queue_history      = [[] for _ in range(C.NO_INTERSECTIONS)]
+        self.timeseries_rows    = []
         self._csv_file          = None
         self._csv_writer        = None
+        self._legacy_csv_file   = None
+        self._legacy_writer     = None
         if not C.DISABLE_LOG:
             self._init_csv()
 
     def _init_csv(self):
-        fname        = C.LOG_FILE
-        write_header = not os.path.exists(fname)
-        self._csv_file   = open(fname, "a", newline="")
+        write_header = not os.path.exists(self.artifacts.timeseries_path)
+        self._csv_file = open(self.artifacts.timeseries_path, "a", newline="")
         self._csv_writer = csv.writer(self._csv_file)
         if write_header:
             self._csv_writer.writerow([
-                "timestamp", "elapsed_s", "mode", "seed", "spawn_rate", "iid",
+                "elapsed_s", "mode", "seed", "spawn_rate", "iid",
                 "avg_wait_s", "p95_wait_s", "max_wait_s",
                 "avg_queue", "max_queue",
                 "throughput_per_min", "fairness_index",
                 "total_crossed", "total_spawned",
+                "external_spawned", "transferred_in",
+                "exited_world", "red_light_violations",
+                "queue_right", "queue_down", "queue_left", "queue_up",
             ])
+        if C.LEGACY_LOG:
+            legacy_header = not os.path.exists(C.LOG_FILE)
+            self._legacy_csv_file = open(C.LOG_FILE, "a", newline="")
+            self._legacy_writer = csv.writer(self._legacy_csv_file)
+            if legacy_header:
+                self._legacy_writer.writerow([
+                    "timestamp", "elapsed_s", "mode", "seed", "spawn_rate", "iid",
+                    "avg_wait_s", "p95_wait_s", "max_wait_s",
+                    "avg_queue", "max_queue", "throughput_per_min", "fairness_index",
+                    "total_crossed", "total_spawned",
+                ])
 
-    def vehicle_spawned(self, vehicle):
-        self.vehicle_entry_time[vehicle.uid] = time.time()
+    def vehicle_spawned(self, vehicle, sim_time, source="external"):
         self.total_spawned[vehicle.iid] += 1
+        if source == "external":
+            self.external_spawned[vehicle.iid] += 1
+        else:
+            self.transferred_in[vehicle.iid] += 1
 
-    def vehicle_crossed(self, vehicle):
+    def vehicle_crossed(self, vehicle, sim_time, violated_red=False):
         iid = vehicle.iid
         self.total_crossed[iid] += 1
-        entry = self.vehicle_entry_time.pop(vehicle.uid, None)
-        if entry is not None:
-            self.wait_samples[iid].append(time.time() - entry)
+        if violated_red:
+            self.red_violations[iid] += 1
+        waited = vehicle.total_wait_s
+        if vehicle.waiting and vehicle.wait_start is not None:
+            waited += max(0.0, sim_time - vehicle.wait_start)
+        self.wait_samples[iid].append(waited)
+        self.wait_samples_by_dir[iid][vehicle.direction].append(waited)
+
+    def vehicle_exited(self, iid):
+        self.exited_world[iid] += 1
 
     def record_queue(self, iid, q):
         self.queue_history[iid].append(q)
 
-    def get_avg_wait(self, iid):
-        s = self.wait_samples[iid]
+    def _all_waits(self, iid, vehicles_state, sim_time):
+        waits = list(self.wait_samples[iid])
+        for d in C.DIRECTION_NUMS.values():
+            for lane in range(3):
+                for v in vehicles_state[iid][d][lane]:
+                    if v.crossed != 0:
+                        continue
+                    w = v.total_wait_s
+                    if v.waiting and v.wait_start is not None:
+                        w += max(0.0, sim_time - v.wait_start)
+                    waits.append(w)
+        return waits
+
+    def _all_waits_dir(self, iid, direction, vehicles_state, sim_time):
+        waits = list(self.wait_samples_by_dir[iid][direction])
+        for lane in range(3):
+            for v in vehicles_state[iid][direction][lane]:
+                if v.crossed != 0:
+                    continue
+                w = v.total_wait_s
+                if v.waiting and v.wait_start is not None:
+                    w += max(0.0, sim_time - v.wait_start)
+                waits.append(w)
+        return waits
+
+    def get_avg_wait(self, iid, vehicles_state, sim_time):
+        s = self._all_waits(iid, vehicles_state, sim_time)
         return sum(s) / len(s) if s else 0.0
 
-    def get_p95_wait(self, iid):
-        s = sorted(self.wait_samples[iid])
+    def get_p95_wait(self, iid, vehicles_state, sim_time):
+        s = sorted(self._all_waits(iid, vehicles_state, sim_time))
         if not s:
             return 0.0
         return s[min(int(0.95 * len(s)), len(s) - 1)]
 
-    def get_max_wait(self, iid):
-        return max(self.wait_samples[iid], default=0.0)
+    def get_max_wait(self, iid, vehicles_state, sim_time):
+        return max(self._all_waits(iid, vehicles_state, sim_time), default=0.0)
+
+    def get_avg_wait_dir(self, iid, direction, vehicles_state, sim_time):
+        s = self._all_waits_dir(iid, direction, vehicles_state, sim_time)
+        return sum(s) / len(s) if s else 0.0
 
     def get_avg_queue(self, iid):
         h = self.queue_history[iid]
@@ -236,13 +364,15 @@ class MetricsEngine:
     def get_max_queue(self, iid):
         return max(self.queue_history[iid], default=0)
 
-    def get_throughput(self, iid):
-        elapsed = max(time.time() - self.start_time, 1.0)
+    def get_throughput(self, iid, sim_time):
+        elapsed = max(sim_time - self.start_time, 1.0)
         return self.total_crossed[iid] / elapsed * 60.0
 
     def get_fairness_index(self, iid, vehicles_state):
         qs = [
-            sum(len(vehicles_state[iid][d][lane]) for lane in range(3))
+            sum(1 for lane in range(3)
+                for v in vehicles_state[iid][d][lane]
+                if v.crossed == 0)
             for d in C.DIRECTION_NUMS.values()
         ]
         total = sum(qs)
@@ -253,57 +383,91 @@ class MetricsEngine:
         den = n * sum(q * q for q in qs)
         return num / den if den > 0 else 1.0
 
-    def maybe_log(self, vehicles_state):
+    def maybe_log(self, sim_time, vehicles_state):
         if C.DISABLE_LOG or self._csv_writer is None:
             return
-        now = time.time()
-        if now - self.last_log_time < C.METRIC_INTERVAL:
+        if sim_time - self.last_log_time < C.METRIC_INTERVAL:
             return
-        self.last_log_time = now
-        elapsed = now - self.start_time
-        ts      = datetime.utcnow().isoformat()
+        self.last_log_time = sim_time
+        elapsed = sim_time - self.start_time
+        ts = datetime.now(timezone.utc).isoformat()
         for iid in range(C.NO_INTERSECTIONS):
             qs = [
-                sum(len(vehicles_state[iid][d][lane]) for lane in range(3))
+                sum(1 for lane in range(3)
+                    for v in vehicles_state[iid][d][lane]
+                    if v.crossed == 0)
                 for d in C.DIRECTION_NUMS.values()
             ]
-            self._csv_writer.writerow([
-                ts, f"{elapsed:.1f}", C.CONTROL_MODE, C.SEED, C.SPAWN_RATE, iid,
-                f"{self.get_avg_wait(iid):.3f}",
-                f"{self.get_p95_wait(iid):.3f}",
-                f"{self.get_max_wait(iid):.3f}",
+            row = [
+                f"{elapsed:.1f}", C.CONTROL_MODE, C.SEED, C.SPAWN_RATE, iid,
+                f"{self.get_avg_wait(iid, vehicles_state, sim_time):.3f}",
+                f"{self.get_p95_wait(iid, vehicles_state, sim_time):.3f}",
+                f"{self.get_max_wait(iid, vehicles_state, sim_time):.3f}",
                 f"{self.get_avg_queue(iid):.3f}",
                 f"{self.get_max_queue(iid)}",
-                f"{self.get_throughput(iid):.3f}",
+                f"{self.get_throughput(iid, sim_time):.3f}",
                 f"{self.get_fairness_index(iid, vehicles_state):.4f}",
                 self.total_crossed[iid],
                 self.total_spawned[iid],
-            ])
+                self.external_spawned[iid],
+                self.transferred_in[iid],
+                self.exited_world[iid],
+                self.red_violations[iid],
+                qs[0], qs[1], qs[2], qs[3],
+            ]
+            self._csv_writer.writerow(row)
+            if self._legacy_writer is not None:
+                self._legacy_writer.writerow([
+                    ts, f"{elapsed:.1f}", C.CONTROL_MODE, C.SEED, C.SPAWN_RATE, iid,
+                    f"{self.get_avg_wait(iid, vehicles_state, sim_time):.3f}",
+                    f"{self.get_p95_wait(iid, vehicles_state, sim_time):.3f}",
+                    f"{self.get_max_wait(iid, vehicles_state, sim_time):.3f}",
+                    f"{self.get_avg_queue(iid):.3f}",
+                    f"{self.get_max_queue(iid)}",
+                    f"{self.get_throughput(iid, sim_time):.3f}",
+                    f"{self.get_fairness_index(iid, vehicles_state):.4f}",
+                    self.total_crossed[iid],
+                    self.total_spawned[iid],
+                ])
         self._csv_file.flush()
+        if self._legacy_csv_file:
+            self._legacy_csv_file.flush()
 
-    def snapshot(self, iid, vehicles_state):
+    def snapshot(self, iid, vehicles_state, sim_time):
         qs = [
-            sum(len(vehicles_state[iid][d][lane]) for lane in range(3))
+            sum(1 for lane in range(3)
+                for v in vehicles_state[iid][d][lane]
+                if v.crossed == 0)
             for d in C.DIRECTION_NUMS.values()
         ]
         return {
-            "avg_wait":   self.get_avg_wait(iid),
-            "p95_wait":   self.get_p95_wait(iid),
-            "max_wait":   self.get_max_wait(iid),
-            "throughput": self.get_throughput(iid),
+            "avg_wait":   self.get_avg_wait(iid, vehicles_state, sim_time),
+            "avg_wait_right": self.get_avg_wait_dir(iid, "right", vehicles_state, sim_time),
+            "avg_wait_down":  self.get_avg_wait_dir(iid, "down", vehicles_state, sim_time),
+            "avg_wait_left":  self.get_avg_wait_dir(iid, "left", vehicles_state, sim_time),
+            "avg_wait_up":    self.get_avg_wait_dir(iid, "up", vehicles_state, sim_time),
+            "p95_wait":   self.get_p95_wait(iid, vehicles_state, sim_time),
+            "max_wait":   self.get_max_wait(iid, vehicles_state, sim_time),
+            "throughput": self.get_throughput(iid, sim_time),
             "avg_queue":  self.get_avg_queue(iid),
             "max_queue":  self.get_max_queue(iid),
             "queues":     qs,
             "crossed":    self.total_crossed[iid],
             "spawned":    self.total_spawned[iid],
+            "external_spawned": self.external_spawned[iid],
+            "transferred_in": self.transferred_in[iid],
+            "exited_world": self.exited_world[iid],
+            "red_light_violations": self.red_violations[iid],
             "fairness":   self.get_fairness_index(iid, vehicles_state),
         }
 
     def close(self):
         if self._csv_file:
             self._csv_file.close()
+        if self._legacy_csv_file:
+            self._legacy_csv_file.close()
 
-metrics = MetricsEngine()
+metrics = None
 
 # =============================================================================
 # TRAFFIC SIGNAL
@@ -314,6 +478,71 @@ class TrafficSignal:
         self.yellow     = yellow
         self.green      = green
         self.signalText = ""
+
+
+class TabularRLPolicy:
+    def __init__(self, path, training):
+        self.path = path
+        self.training = training
+        self.alpha = C.RL_ALPHA
+        self.gamma = C.RL_GAMMA
+        self.epsilon = C.RL_EPSILON
+        self.epsilon_min = C.RL_EPSILON_MIN
+        self.epsilon_decay = C.RL_EPSILON_DECAY
+        self.q = {}
+        self.updates = 0
+        if os.path.exists(self.path):
+            self.load()
+
+    def _key(self, state):
+        return "|".join(str(x) for x in state)
+
+    def _ensure(self, key):
+        if key not in self.q:
+            self.q[key] = [0.0, 0.0, 0.0, 0.0]
+        return self.q[key]
+
+    def act(self, state):
+        key = self._key(state)
+        values = self._ensure(key)
+        if self.training and RNG.random() < self.epsilon:
+            return RNG.randint(0, 3)
+        best = max(values)
+        best_idxs = [i for i, v in enumerate(values) if v == best]
+        return RNG.choice(best_idxs)
+
+    def update(self, state, action, reward, next_state):
+        if not self.training:
+            return
+        key = self._key(state)
+        next_key = self._key(next_state)
+        q_s = self._ensure(key)
+        q_n = self._ensure(next_key)
+        td_target = reward + self.gamma * max(q_n)
+        q_s[action] += self.alpha * (td_target - q_s[action])
+        self.updates += 1
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+    def load(self):
+        with open(self.path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.q = {k: list(v) for k, v in data.get("q_table", {}).items()}
+        if "epsilon" in data:
+            self.epsilon = float(data["epsilon"])
+
+    def save(self):
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({
+                "q_table": self.q,
+                "epsilon": self.epsilon,
+                "updates": self.updates,
+                "seed": C.SEED,
+                "saved_utc": datetime.now(timezone.utc).isoformat(),
+            }, f, indent=2)
+
+
+RL_POLICY = None
 
 # =============================================================================
 # SIGNAL CONTROLLERS
@@ -353,10 +582,10 @@ class SignalController:
         var = sum((q - avg) ** 2 for q in state_after["queue_lengths"]) / 4.0
         return -(q_a + 0.1 * q_b + 0.05 * var)
 
-    def next_green_duration(self, signals_list, cur_green, vehicles_state):
+    def next_green_duration(self, signals_list, cur_green, vehicles_state, now_s):
         return C.DEFAULT_GREEN[cur_green[self.iid]]
 
-    def choose_next_phase(self, vehicles_state, cur_green):
+    def choose_next_phase(self, vehicles_state, cur_green, now_s):
         # Default: round-robin
         return (cur_green[self.iid] + 1) % C.NO_OF_SIGNALS
 
@@ -367,10 +596,10 @@ class FixedTimeController(SignalController):
     Fixed cycle, fixed duration. Every direction gets exactly the same
     green time in strict round-robin order regardless of traffic load.
     """
-    def next_green_duration(self, signals_list, cur_green, vehicles_state):
+    def next_green_duration(self, signals_list, cur_green, vehicles_state, now_s):
         return C.DEFAULT_GREEN[cur_green[self.iid]]
 
-    def choose_next_phase(self, vehicles_state, cur_green):
+    def choose_next_phase(self, vehicles_state, cur_green, now_s):
         return (cur_green[self.iid] + 1) % C.NO_OF_SIGNALS
 
 
@@ -381,19 +610,22 @@ class GreedyController(SignalController):
     Duration scales with queue depth.
     AI class: goal-based / simple-reflex agent.
     """
-    def choose_next_phase(self, vehicles_state, cur_green):
+    def choose_next_phase(self, vehicles_state, cur_green, now_s):
         iid    = self.iid
         queues = [
-            sum(len(vehicles_state[iid][C.DIRECTION_NUMS[dn]][lane])
-                for lane in range(3))
+            sum(1 for lane in range(3)
+                for v in vehicles_state[iid][C.DIRECTION_NUMS[dn]][lane]
+                if v.crossed == 0)
             for dn in range(4)
         ]
         return max(range(4), key=lambda i: queues[i])
 
-    def next_green_duration(self, signals_list, cur_green, vehicles_state):
+    def next_green_duration(self, signals_list, cur_green, vehicles_state, now_s):
         iid = self.iid
         d   = C.DIRECTION_NUMS[cur_green[iid]]
-        q   = sum(len(vehicles_state[iid][d][lane]) for lane in range(3))
+        q   = sum(1 for lane in range(3)
+                  for v in vehicles_state[iid][d][lane]
+                  if v.crossed == 0)
         return int(max(C.MIN_GREEN, min(C.MAX_GREEN, C.MIN_GREEN + q * 1.5)))
 
 
@@ -412,25 +644,26 @@ class AdaptiveController(SignalController):
     """
     def __init__(self, iid):
         super().__init__(iid)
-        self._last_green_time = {dn: time.time() for dn in range(4)}
+        self._last_green_time = {dn: 0.0 for dn in range(4)}
 
-    def _utility(self, vehicles_state, cur_green):
+    def _utility(self, vehicles_state, cur_green, now_s):
         iid  = self.iid
-        now  = time.time()
         util = {}
         for dn in range(4):
             d = C.DIRECTION_NUMS[dn]
-            q = sum(len(vehicles_state[iid][d][lane]) for lane in range(3))
+            q = sum(1 for lane in range(3)
+                    for v in vehicles_state[iid][d][lane]
+                    if v.crossed == 0)
             waits = [
-                now - v.wait_start
+                now_s - v.wait_start
                 for lane in range(3)
                 for v in vehicles_state[iid][d][lane]
-                if v.crossed == 0 and v.waiting and v.wait_start
+                if v.crossed == 0 and v.waiting and v.wait_start is not None
             ]
             avg_wait   = sum(waits) / len(waits) if waits else 0.0
             starvation = max(
                 0.0,
-                (now - self._last_green_time.get(dn, now))
+                (now_s - self._last_green_time.get(dn, now_s))
                 - C.ADAPTIVE_STARVATION_T
             )
             util[dn] = (
@@ -440,25 +673,82 @@ class AdaptiveController(SignalController):
             )
         return util
 
-    def choose_next_phase(self, vehicles_state, cur_green):
-        self._last_green_time[cur_green[self.iid]] = time.time()
-        return max(self._utility(vehicles_state, cur_green),
-                   key=self._utility(vehicles_state, cur_green).get)
+    def choose_next_phase(self, vehicles_state, cur_green, now_s):
+        self._last_green_time[cur_green[self.iid]] = now_s
+        util = self._utility(vehicles_state, cur_green, now_s)
+        return max(util, key=util.get)
 
-    def next_green_duration(self, signals_list, cur_green, vehicles_state):
+    def next_green_duration(self, signals_list, cur_green, vehicles_state, now_s):
         iid = self.iid
         d   = C.DIRECTION_NUMS[cur_green[iid]]
-        q   = sum(len(vehicles_state[iid][d][lane]) for lane in range(3))
+        q   = sum(1 for lane in range(3)
+                  for v in vehicles_state[iid][d][lane]
+                  if v.crossed == 0)
         return int(max(C.MIN_GREEN, min(C.MAX_GREEN, C.MIN_GREEN + q * 1.8)))
 
 
 class RandomController(SignalController):
     """Null baseline — random durations AND random phase order."""
-    def next_green_duration(self, signals_list, cur_green, vehicles_state):
-        return random.randint(C.MIN_GREEN, C.MAX_GREEN)
+    def next_green_duration(self, signals_list, cur_green, vehicles_state, now_s):
+        return RNG.randint(C.MIN_GREEN, C.MAX_GREEN)
 
-    def choose_next_phase(self, vehicles_state, cur_green):
-        return random.randint(0, 3)
+    def choose_next_phase(self, vehicles_state, cur_green, now_s):
+        return RNG.randint(0, 3)
+
+
+class RLController(SignalController):
+    """
+    Tabular Q-learning controller.
+    Action space: next phase in {0,1,2,3}.
+    State: (current_phase, bucketed queues for right/down/left/up).
+    """
+    def __init__(self, iid):
+        super().__init__(iid)
+        self.prev_state = None
+        self.prev_action = None
+        self.prev_queue_total = None
+
+    def _queues(self, vehicles_state):
+        iid = self.iid
+        return [
+            sum(1 for lane in range(3)
+                for v in vehicles_state[iid][C.DIRECTION_NUMS[dn]][lane]
+                if v.crossed == 0)
+            for dn in range(4)
+        ]
+
+    def _state(self, vehicles_state, cur_green):
+        qs = self._queues(vehicles_state)
+        # 0-2,3-5,6-8,... keeps table size manageable.
+        binned = [min(q // 3, 8) for q in qs]
+        return (cur_green[self.iid], *binned)
+
+    def choose_next_phase(self, vehicles_state, cur_green, now_s):
+        global RL_POLICY
+        if RL_POLICY is None:
+            return RNG.randint(0, 3)
+
+        state = self._state(vehicles_state, cur_green)
+        q_total = sum(self._queues(vehicles_state))
+        if (self.prev_state is not None and self.prev_action is not None and
+                self.prev_queue_total is not None):
+            # Reward queue reduction while discouraging sustained congestion.
+            reward = (self.prev_queue_total - q_total) - 0.05 * q_total
+            RL_POLICY.update(self.prev_state, self.prev_action, reward, state)
+
+        action = RL_POLICY.act(state)
+        self.prev_state = state
+        self.prev_action = action
+        self.prev_queue_total = q_total
+        return action
+
+    def next_green_duration(self, signals_list, cur_green, vehicles_state, now_s):
+        iid = self.iid
+        d = C.DIRECTION_NUMS[cur_green[iid]]
+        q = sum(1 for lane in range(3)
+                for v in vehicles_state[iid][d][lane]
+                if v.crossed == 0)
+        return int(max(C.MIN_GREEN, min(C.MAX_GREEN, C.MIN_GREEN + q * 1.6)))
 
 
 CONTROLLER_MAP = {
@@ -466,6 +756,7 @@ CONTROLLER_MAP = {
     "adaptive": AdaptiveController,
     "greedy":   GreedyController,
     "random":   RandomController,
+    "rl":       RLController,
 }
 
 # =============================================================================
@@ -477,15 +768,15 @@ class Particle:
     _OY = {'right': 0,  'left': 0, 'down': -1, 'up': 1}
 
     def __init__(self, x, y, direction):
-        self.x        = x + random.uniform(-3, 3)
-        self.y        = y + random.uniform(-3, 3)
-        self.vx       = self._OX[direction] * random.uniform(0.4, 1.4) + random.uniform(-0.3, 0.3)
-        self.vy       = self._OY[direction] * random.uniform(0.4, 1.4) + random.uniform(-0.3, 0.3)
-        self.max_life = random.randint(18, 42)
+        self.x        = x + RNG.uniform(-3, 3)
+        self.y        = y + RNG.uniform(-3, 3)
+        self.vx       = self._OX[direction] * RNG.uniform(0.4, 1.4) + RNG.uniform(-0.3, 0.3)
+        self.vy       = self._OY[direction] * RNG.uniform(0.4, 1.4) + RNG.uniform(-0.3, 0.3)
+        self.max_life = RNG.randint(18, 42)
         self.life     = self.max_life
-        g             = random.randint(130, 195)
+        g             = RNG.randint(130, 195)
         self.color    = (g, g, g)
-        self.size     = random.uniform(1.5, 3.5)
+        self.size     = RNG.uniform(1.5, 3.5)
 
     def update(self):
         self.x    += self.vx
@@ -531,7 +822,7 @@ class Vehicle(pygame.sprite.Sprite):
     _id_counter = 0
 
     def __init__(self, iid, lane, vehicleClass, direction_number, direction,
-                 sim_group):
+                 sim_group, sim_time):
         pygame.sprite.Sprite.__init__(self)
 
         Vehicle._id_counter += 1
@@ -549,6 +840,7 @@ class Vehicle(pygame.sprite.Sprite):
         self.total_wait_s     = 0.0
         self._particle_timer  = 0
         self._offscreen       = False
+        self._in_lane         = False
 
         self.x = _spawn_x[iid][direction][lane]
         self.y = _spawn_y[iid][direction][lane]
@@ -558,23 +850,7 @@ class Vehicle(pygame.sprite.Sprite):
         self.rect  = self.image.get_rect()
 
         # Register
-        _vehicles[iid][direction][lane].append(self)
-        self.index = len(_vehicles[iid][direction][lane]) - 1
-
-        # ---- Stop position ----
-        if (self.index > 0 and
-                _vehicles[iid][direction][lane][self.index - 1].crossed == 0):
-            prev = _vehicles[iid][direction][lane][self.index - 1]
-            if direction == 'right':
-                self.stop = prev.stop - prev.rect.width  - C.STOPPING_GAP
-            elif direction == 'left':
-                self.stop = prev.stop + prev.rect.width  + C.STOPPING_GAP
-            elif direction == 'down':
-                self.stop = prev.stop - prev.rect.height - C.STOPPING_GAP
-            elif direction == 'up':
-                self.stop = prev.stop + prev.rect.height + C.STOPPING_GAP
-        else:
-            self.stop = default_stop_pos(iid, direction)
+        self._attach_to_lane(iid)
 
         # ---- Advance spawn stack ----
         if direction == 'right':
@@ -586,11 +862,94 @@ class Vehicle(pygame.sprite.Sprite):
         elif direction == 'up':
             _spawn_y[iid][direction][lane] += self.rect.height + C.STOPPING_GAP
 
-        metrics.vehicle_spawned(self)
+        metrics.vehicle_spawned(self, sim_time, source="external")
         sim_group.add(self)
 
+    def _lane_bucket(self, iid=None):
+        target_iid = self.iid if iid is None else iid
+        return _vehicles[target_iid][self.direction][self.lane]
+
+    def _set_stop_position(self, iid):
+        lane_bucket = self._lane_bucket(iid)
+        if self.index > 0 and lane_bucket[self.index - 1].crossed == 0:
+            prev = lane_bucket[self.index - 1]
+            if self.direction == 'right':
+                self.stop = prev.stop - prev.rect.width - C.STOPPING_GAP
+            elif self.direction == 'left':
+                self.stop = prev.stop + prev.rect.width + C.STOPPING_GAP
+            elif self.direction == 'down':
+                self.stop = prev.stop - prev.rect.height - C.STOPPING_GAP
+            elif self.direction == 'up':
+                self.stop = prev.stop + prev.rect.height + C.STOPPING_GAP
+        else:
+            self.stop = default_stop_pos(iid, self.direction)
+
+    def _attach_to_lane(self, iid):
+        self.iid = iid
+        lane_bucket = self._lane_bucket()
+        lane_bucket.append(self)
+        self.index = len(lane_bucket) - 1
+        self._in_lane = True
+        self._set_stop_position(iid)
+
+    def _detach_from_lane(self):
+        if not self._in_lane:
+            return
+        lane_bucket = self._lane_bucket()
+        if 0 <= self.index < len(lane_bucket) and lane_bucket[self.index] is self:
+            remove_at = self.index
+        else:
+            try:
+                remove_at = lane_bucket.index(self)
+            except ValueError:
+                self._in_lane = False
+                self.index = -1
+                return
+        lane_bucket.pop(remove_at)
+        for idx in range(remove_at, len(lane_bucket)):
+            lane_bucket[idx].index = idx
+        self._in_lane = False
+        self.index = -1
+
+    def _handoff_to(self, new_iid, sim_time):
+        self._detach_from_lane()
+        self.crossed = 0
+        self.waiting = False
+        self.wait_start = None
+        self._attach_to_lane(new_iid)
+        metrics.vehicle_spawned(self, sim_time, source="transfer")
+
+    def _edge_handoff_target(self, w, h):
+        row = self.iid // C.GRID_COLS
+        col = self.iid % C.GRID_COLS
+        ox, oy = C.OFFSETS[self.iid]
+        left = ox
+        right = ox + C.TILE_W
+        top = oy
+        bottom = oy + C.TILE_H
+
+        if self.direction == 'right' and self.x + w >= right:
+            col += 1
+        elif self.direction == 'left' and self.x <= left:
+            col -= 1
+        elif self.direction == 'down' and self.y + h >= bottom:
+            row += 1
+        elif self.direction == 'up' and self.y <= top:
+            row -= 1
+        else:
+            return None
+
+        if row < 0 or row >= C.GRID_ROWS or col < 0 or col >= C.GRID_COLS:
+            return -1
+        return row * C.GRID_COLS + col
+
+    def despawn(self):
+        metrics.vehicle_exited(self.iid)
+        self._detach_from_lane()
+        self.kill()
+
     # ------------------------------------------------------------------
-    def move(self, cur_green, cur_yellow):
+    def move(self, cur_green, cur_yellow, sim_time, dt_scale):
         """
         Movement logic.
 
@@ -617,24 +976,27 @@ class Vehicle(pygame.sprite.Sprite):
 
         # My signal slot
         my_signal = C.DIRECTION_TO_SIGNAL[d]
+        my_green = (cg == my_signal) and (cy == 0)
+        # Count red violations only when another direction owns green.
+        # Yellow on the same phase is treated as legal "clearance" time.
+        my_red = (cg != my_signal)
 
         # ---- 1. Crossing detection ----
         sl = stop_line(iid, d)
         if self.crossed == 0:
             hit = (
-                (d == 'right' and self.x + w > sl) or
-                (d == 'left'  and self.x       < sl) or
-                (d == 'down'  and self.y + h   > sl) or
-                (d == 'up'    and self.y        < sl)
+                (d == 'right' and self.x + w >= sl) or
+                (d == 'left'  and self.x       <= sl) or
+                (d == 'down'  and self.y + h   >= sl) or
+                (d == 'up'    and self.y        <= sl)
             )
             if hit:
                 self.crossed = 1
-                metrics.vehicle_crossed(self)
+                metrics.vehicle_crossed(self, sim_time, violated_red=my_red)
 
         # ---- 2. Is it my green? ----
         # Green only when:  the current green phase matches MY signal slot
         #                   AND we are not in yellow
-        my_green = (cg == my_signal) and (cy == 0)
 
         # ---- 3. Gap to vehicle ahead ----
         gap_ok = True
@@ -673,27 +1035,54 @@ class Vehicle(pygame.sprite.Sprite):
         # ---- 5. Smooth speed ----
         target = self.speed if can_move else 0.0
         if self.current_speed < target:
-            self.current_speed = min(self.current_speed + C.ACCEL, target)
+            self.current_speed = min(self.current_speed + C.ACCEL * dt_scale, target)
         else:
-            self.current_speed = max(self.current_speed - C.DECEL, target)
+            self.current_speed = max(self.current_speed - C.DECEL * dt_scale, target)
 
         # ---- 6. Wait tracking ----
         if self.current_speed < 0.05:
             if not self.waiting:
                 self.waiting    = True
-                self.wait_start = time.time()
+                self.wait_start = sim_time
         else:
             if self.waiting:
                 self.waiting = False
                 if self.wait_start is not None:
-                    self.total_wait_s += time.time() - self.wait_start
+                    self.total_wait_s += sim_time - self.wait_start
                 self.wait_start = None
 
         # ---- 7. Apply movement ----
-        if d == 'right': self.x += self.current_speed
-        elif d == 'left': self.x -= self.current_speed
-        elif d == 'down': self.y += self.current_speed
-        elif d == 'up':   self.y -= self.current_speed
+        # Prevent momentum overshoot through the stop point when signal is not
+        # green for this direction. This keeps red/yellow compliance strict.
+        must_hold_at_stop = (self.crossed == 0 and not my_green)
+        if d == 'right':
+            proposed = self.x + self.current_speed * dt_scale
+            if must_hold_at_stop:
+                proposed = min(proposed, self.stop - w)
+                if proposed >= self.stop - w:
+                    self.current_speed = 0.0
+            self.x = proposed
+        elif d == 'left':
+            proposed = self.x - self.current_speed * dt_scale
+            if must_hold_at_stop:
+                proposed = max(proposed, self.stop)
+                if proposed <= self.stop:
+                    self.current_speed = 0.0
+            self.x = proposed
+        elif d == 'down':
+            proposed = self.y + self.current_speed * dt_scale
+            if must_hold_at_stop:
+                proposed = min(proposed, self.stop - h)
+                if proposed >= self.stop - h:
+                    self.current_speed = 0.0
+            self.y = proposed
+        elif d == 'up':
+            proposed = self.y - self.current_speed * dt_scale
+            if must_hold_at_stop:
+                proposed = max(proposed, self.stop)
+                if proposed <= self.stop:
+                    self.current_speed = 0.0
+            self.y = proposed
 
         # ---- 8. Particles ----
         if C.PARTICLE_EFFECTS and self.current_speed > 0.5:
@@ -701,14 +1090,14 @@ class Vehicle(pygame.sprite.Sprite):
             if self._particle_timer % 8 == 0:
                 _particle_pool.append(Particle(self.x, self.y, d))
 
-        # ---- 9. Off-screen cull ----
-        # Use a generous margin (200px) so vehicles that are still
-        # partially on the far side of a tile boundary don't get culled.
-        ox, oy = C.OFFSETS[iid]
-        margin = 200
-        if (self.x < ox - margin or self.x > ox + C.TILE_W + margin or
-                self.y < oy - margin or self.y > oy + C.TILE_H + margin):
+        # ---- 9. Tile boundary transition ----
+        # Move to neighboring tile and continue under that intersection's
+        # signal rules. Despawn only when leaving the outer world boundary.
+        target_iid = self._edge_handoff_target(w, h)
+        if target_iid == -1:
             self._offscreen = True
+        elif target_iid is not None and target_iid != self.iid:
+            self._handoff_to(target_iid, sim_time)
 
 # =============================================================================
 # SIMULATION STATE
@@ -717,17 +1106,14 @@ class SimState:
     def __init__(self):
         global _spawn_x, _spawn_y, _vehicles
 
-        self.sim_group   = pygame.sprite.Group()
-        self.signals     = [[] for _ in range(C.NO_INTERSECTIONS)]
-
-        # -----------------------------------------------------------------------
-        # cur_green[iid] stores the SIGNAL SLOT index (0-3) that is currently
-        # green. Signal slot 0 = right, 1 = down, 2 = left, 3 = up.
-        # We initialise slot 0 (right) as green at every intersection.
-        # -----------------------------------------------------------------------
-        self.cur_green   = [0] * C.NO_INTERSECTIONS
-        self.next_green  = [1] * C.NO_INTERSECTIONS
-        self.cur_yellow  = [0] * C.NO_INTERSECTIONS
+        self.sim_group       = pygame.sprite.Group()
+        self.signals         = [[] for _ in range(C.NO_INTERSECTIONS)]
+        self.cur_green       = [0] * C.NO_INTERSECTIONS
+        self.next_green      = [1] * C.NO_INTERSECTIONS
+        self.cur_yellow      = [0] * C.NO_INTERSECTIONS
+        self.signal_accum_s  = [0.0] * C.NO_INTERSECTIONS
+        self.spawn_accum_s   = 0.0
+        self.queue_accum_s   = 0.0
 
         ctrl_cls = CONTROLLER_MAP.get(C.CONTROL_MODE, AdaptiveController)
         self.controllers = [ctrl_cls(iid) for iid in range(C.NO_INTERSECTIONS)]
@@ -747,25 +1133,15 @@ class SimState:
             _vehicles.append({d: {0: [], 1: [], 2: []}
                                for d in C.DIRECTION_NUMS.values()})
 
-        self.vehicles    = _vehicles
-        self.start_time  = time.time()
-        self.paused      = False
-        self.frame_count = 0
+        self.vehicles      = _vehicles
+        self.start_time    = 0.0
+        self.sim_time      = 0.0
+        self.paused        = False
+        self.frame_count   = 0
 
-        # Signal threads
         for iid in range(C.NO_INTERSECTIONS):
-            threading.Thread(
-                target=self._init_signals, args=(iid,),
-                daemon=True, name=f"sig_{iid}"
-            ).start()
-
-        time.sleep(0.4)   # let signals initialise before vehicles spawn
-
-        # Vehicle generator thread
-        threading.Thread(
-            target=self._generate_vehicles,
-            daemon=True, name="gen"
-        ).start()
+            self._init_signals(iid)
+            self._activate_green(iid)
 
     # ------------------------------------------------------------------
     # Signal management
@@ -779,68 +1155,21 @@ class SimState:
         ts3 = TrafficSignal(C.DEFAULT_RED, C.DEFAULT_YELLOW, C.DEFAULT_GREEN[2])
         ts4 = TrafficSignal(C.DEFAULT_RED, C.DEFAULT_YELLOW, C.DEFAULT_GREEN[3])
         self.signals[iid] = [ts1, ts2, ts3, ts4]
-        self._signal_loop(iid)
 
-    def _signal_loop(self, iid):
-        """
-        Signal timing loop for one intersection.
-
-        cur_green[iid] is the index into self.signals[iid] AND the index
-        into DIRECTION_TO_SIGNAL — they use the same numbering:
-            0 = right, 1 = down, 2 = left, 3 = up
-
-        This guarantees vehicles always know exactly which signal is theirs.
-        """
-        while True:
-            ctrl = self.controllers[iid]
-
-            # Let controller set green duration
-            dur = ctrl.next_green_duration(
-                self.signals, self.cur_green, self.vehicles
+    def _activate_green(self, iid):
+        ctrl = self.controllers[iid]
+        dur = int(max(C.MIN_GREEN, min(
+            C.MAX_GREEN,
+            ctrl.next_green_duration(
+                self.signals, self.cur_green, self.vehicles, self.sim_time
             )
-            self.signals[iid][self.cur_green[iid]].green = dur
-
-            # Green countdown
-            while self.signals[iid][self.cur_green[iid]].green > 0:
-                if not self.paused:
-                    self._tick(iid)
-                time.sleep(1)
-
-            # Controller picks next phase
-            self.next_green[iid] = ctrl.choose_next_phase(
-                self.vehicles, self.cur_green
-            )
-
-            # Yellow phase
-            self.cur_yellow[iid] = 1
-            d_cur = C.DIRECTION_NUMS[self.cur_green[iid]]
-            for lane in range(3):
-                for v in self.vehicles[iid][d_cur][lane]:
-                    v.stop = default_stop_pos(iid, d_cur)
-
-            while self.signals[iid][self.cur_green[iid]].yellow > 0:
-                if not self.paused:
-                    self._tick(iid)
-                time.sleep(1)
-
-            self.cur_yellow[iid] = 0
-
-            # Reset outgoing signal timers
-            cg = self.cur_green[iid]
-            self.signals[iid][cg].green  = C.DEFAULT_GREEN[cg]
-            self.signals[iid][cg].yellow = C.DEFAULT_YELLOW
-            self.signals[iid][cg].red    = C.DEFAULT_RED
-
-            # Advance to next phase
-            self.cur_green[iid]  = self.next_green[iid]
-            self.next_green[iid] = (self.cur_green[iid] + 1) % C.NO_OF_SIGNALS
-
-            ng     = self.next_green[iid]
-            cg_new = self.cur_green[iid]
-            self.signals[iid][ng].red = (
-                self.signals[iid][cg_new].yellow +
-                self.signals[iid][cg_new].green
-            )
+        )))
+        self.signals[iid][self.cur_green[iid]].green = dur
+        self.signals[iid][self.cur_green[iid]].yellow = C.DEFAULT_YELLOW
+        ng = self.next_green[iid]
+        self.signals[iid][ng].red = (
+            self.signals[iid][self.cur_green[iid]].yellow + dur
+        )
 
     def _tick(self, iid):
         for i in range(C.NO_OF_SIGNALS):
@@ -858,52 +1187,89 @@ class SimState:
                     0, self.signals[iid][i].red - 1
                 )
 
-    # ------------------------------------------------------------------
-    # Vehicle generation
-    # ------------------------------------------------------------------
-    def _generate_vehicles(self):
-        while True:
-            if not self.paused:
-                iid   = random.randint(0, C.NO_INTERSECTIONS - 1)
-                vtype = random.randint(0, 3)
-                lane  = random.randint(1, 2)
-                t     = random.randint(0, 99)
-                dist  = C.DIRECTION_DIST
-                if   t < dist[0]: dn = 0
-                elif t < dist[1]: dn = 1
-                elif t < dist[2]: dn = 2
-                else:             dn = 3
-                Vehicle(iid, lane,
-                        C.VEHICLE_TYPES[vtype],
-                        dn, C.DIRECTION_NUMS[dn],
-                        self.sim_group)
-            time.sleep(C.SPAWN_INTERVAL)
+    def _step_signals_one_second(self, iid):
+        self._tick(iid)
+        cg = self.cur_green[iid]
+        if self.cur_yellow[iid]:
+            if self.signals[iid][cg].yellow == 0:
+                self.cur_yellow[iid] = 0
+                self.signals[iid][cg].green  = C.DEFAULT_GREEN[cg]
+                self.signals[iid][cg].yellow = C.DEFAULT_YELLOW
+                self.signals[iid][cg].red    = C.DEFAULT_RED
+                self.cur_green[iid] = self.next_green[iid]
+                self.next_green[iid] = (self.cur_green[iid] + 1) % C.NO_OF_SIGNALS
+                self._activate_green(iid)
+            return
+
+        if self.signals[iid][cg].green == 0:
+            ctrl = self.controllers[iid]
+            self.next_green[iid] = ctrl.choose_next_phase(
+                self.vehicles, self.cur_green, self.sim_time
+            )
+            self.cur_yellow[iid] = 1
+            d_cur = C.DIRECTION_NUMS[cg]
+            for lane in range(3):
+                for v in self.vehicles[iid][d_cur][lane]:
+                    v.stop = default_stop_pos(iid, d_cur)
+
+    def _spawn_vehicle(self):
+        iid   = RNG.randint(0, C.NO_INTERSECTIONS - 1)
+        vtype = RNG.randint(0, 3)
+        lane  = RNG.randint(1, 2)
+        t     = RNG.randint(0, 99)
+        dist  = C.DIRECTION_DIST
+        if   t < dist[0]: dn = 0
+        elif t < dist[1]: dn = 1
+        elif t < dist[2]: dn = 2
+        else:             dn = 3
+        Vehicle(iid, lane,
+                C.VEHICLE_TYPES[vtype],
+                dn, C.DIRECTION_NUMS[dn],
+                self.sim_group, self.sim_time)
 
     # ------------------------------------------------------------------
     # Per-frame update
     # ------------------------------------------------------------------
-    def update(self):
+    def update(self, dt_s):
         if self.paused:
-            return
+            return False
 
+        self.sim_time += dt_s
         self.frame_count += 1
 
-        # Sample queue every 30 frames
-        if self.frame_count % 30 == 0:
+        self.spawn_accum_s += dt_s
+        while self.spawn_accum_s >= C.SPAWN_INTERVAL:
+            self.spawn_accum_s -= C.SPAWN_INTERVAL
+            self._spawn_vehicle()
+
+        for iid in range(C.NO_INTERSECTIONS):
+            self.signal_accum_s[iid] += dt_s
+            while self.signal_accum_s[iid] >= 1.0:
+                self.signal_accum_s[iid] -= 1.0
+                self._step_signals_one_second(iid)
+
+        self.queue_accum_s += dt_s
+        if self.queue_accum_s >= 0.5:
+            self.queue_accum_s = 0.0
             for iid in range(C.NO_INTERSECTIONS):
                 total_q = sum(
-                    len(self.vehicles[iid][d][lane])
+                    1
                     for d in C.DIRECTION_NUMS.values()
                     for lane in range(3)
+                    for v in self.vehicles[iid][d][lane]
+                    if v.crossed == 0
                 )
                 metrics.record_queue(iid, total_q)
 
         # Cull and move
+        dt_scale = dt_s * C.FPS
         for v in list(self.sim_group):
             if v._offscreen:
-                v.kill()
+                v.despawn()
             else:
-                v.move(self.cur_green, self.cur_yellow)
+                v.move(self.cur_green, self.cur_yellow, self.sim_time, dt_scale)
+                if v._offscreen:
+                    v.despawn()
 
         # Particles
         if C.PARTICLE_EFFECTS:
@@ -911,28 +1277,67 @@ class SimState:
                 p.update()
             _particle_pool[:] = [p for p in _particle_pool if p.alive]
 
-        # CSV log
-        metrics.maybe_log(self.vehicles)
+        metrics.maybe_log(self.sim_time, self.vehicles)
+        return bool(C.DURATION > 0 and self.sim_time >= C.DURATION)
 
-        # Auto-exit
-        if C.DURATION > 0 and time.time() - self.start_time >= C.DURATION:
-            metrics.close()
-            self._print_summary()
-            print("\n[Simulation complete]")
-            pygame.quit()
-            sys.exit(0)
+    def build_summary(self):
+        per = []
+        for iid in range(C.NO_INTERSECTIONS):
+            s = metrics.snapshot(iid, self.vehicles, self.sim_time)
+            s["iid"] = iid
+            per.append(s)
+        overall = {
+            "avg_wait": sum(p["avg_wait"] for p in per) / len(per),
+            "avg_wait_right": sum(p["avg_wait_right"] for p in per) / len(per),
+            "avg_wait_down": sum(p["avg_wait_down"] for p in per) / len(per),
+            "avg_wait_left": sum(p["avg_wait_left"] for p in per) / len(per),
+            "avg_wait_up": sum(p["avg_wait_up"] for p in per) / len(per),
+            "p95_wait": sum(p["p95_wait"] for p in per) / len(per),
+            "throughput": sum(p["throughput"] for p in per),
+            "avg_queue": sum(p["avg_queue"] for p in per) / len(per),
+            "fairness": sum(p["fairness"] for p in per) / len(per),
+            "crossed": sum(p["crossed"] for p in per),
+            "spawned": sum(p["spawned"] for p in per),
+            "external_spawned": sum(p["external_spawned"] for p in per),
+            "transferred_in": sum(p["transferred_in"] for p in per),
+            "exited_world": sum(p["exited_world"] for p in per),
+            "red_light_violations": sum(p["red_light_violations"] for p in per),
+        }
+        return {
+            "mode": C.CONTROL_MODE,
+            "seed": C.SEED,
+            "spawn_rate": C.SPAWN_RATE,
+            "duration_s": self.sim_time,
+            "fixed_dt_s": C.FIXED_DT,
+            "rl": {
+                "model_path": C.RL_MODEL_PATH,
+                "training": C.RL_TRAIN,
+                "epsilon": (RL_POLICY.epsilon if RL_POLICY is not None else None),
+                "updates": (RL_POLICY.updates if RL_POLICY is not None else 0),
+            },
+            "intersections": per,
+            "overall": overall,
+        }
 
-    def _print_summary(self):
+    def _print_summary(self, summary=None):
+        summary = summary or self.build_summary()
         print("\n" + "=" * 65)
         print(f"  SUMMARY  mode={C.CONTROL_MODE}  "
               f"seed={C.SEED}  spawn={C.SPAWN_RATE}")
         print("=" * 65)
-        for iid in range(C.NO_INTERSECTIONS):
-            s = metrics.snapshot(iid, self.vehicles)
-            print(f"\n  Intersection {iid}:")
+        for s in summary["intersections"]:
+            print(f"\n  Intersection {s['iid']}:")
             print(f"    Spawned      : {s['spawned']}")
+            print(f"    External     : {s['external_spawned']}")
+            print(f"    Transfer in  : {s['transferred_in']}")
             print(f"    Crossed      : {s['crossed']}")
+            print(f"    Exited world : {s['exited_world']}")
+            print(f"    Red violates : {s['red_light_violations']}")
             print(f"    Avg wait     : {s['avg_wait']:.2f}s")
+            print(f"      by dir     : R {s['avg_wait_right']:.2f}s  "
+                  f"D {s['avg_wait_down']:.2f}s  "
+                  f"L {s['avg_wait_left']:.2f}s  "
+                  f"U {s['avg_wait_up']:.2f}s")
             print(f"    P95 wait     : {s['p95_wait']:.2f}s")
             print(f"    Max wait     : {s['max_wait']:.2f}s")
             print(f"    Throughput   : {s['throughput']:.1f} veh/min")
@@ -964,6 +1369,7 @@ class Renderer:
         "greedy":   (80,  160, 255),
         "adaptive": (80,  230, 130),
         "random":   (230, 180, 60),
+        "rl":       (245, 90, 90),
     }
 
     def __init__(self, state: SimState):
@@ -1152,7 +1558,7 @@ class Renderer:
             pygame.draw.rect(self.hud_surf, color,        (pad, y[0], bw, 7))
             y[0] += 10
 
-        elapsed = int(time.time() - self.state.start_time)
+        elapsed = int(self.state.sim_time)
         mm, ss  = divmod(elapsed, 60)
         fps     = self.clock.get_fps()
         mode_c  = self.MODE_COLORS.get(C.CONTROL_MODE, self.WHITE)
@@ -1166,7 +1572,7 @@ class Renderer:
         sep()
 
         iid  = self.focused_iid
-        snap = metrics.snapshot(iid, self.state.vehicles)
+        snap = metrics.snapshot(iid, self.state.vehicles, self.state.sim_time)
         write(f"INTERSECTION {iid}  [in view]", self.font_md, self.YELLOW)
         y[0] += 2
         write(f"Spawned   : {snap['spawned']}", self.font_xs, (200,200,200))
@@ -1207,7 +1613,7 @@ class Renderer:
 
         write("ALL INTERSECTIONS", self.font_xs, (170,170,210))
         for i in range(C.NO_INTERSECTIONS):
-            sn  = metrics.snapshot(i, self.state.vehicles)
+            sn  = metrics.snapshot(i, self.state.vehicles, self.state.sim_time)
             col = self.CYAN if i == iid else (150,150,175)
             write(f"  [{i}] cross:{sn['crossed']:3d}  "
                   f"W{sn['avg_wait']:4.1f}s  "
@@ -1301,8 +1707,32 @@ class Renderer:
 # =============================================================================
 # MAIN
 # =============================================================================
+def _finalize_run(state: SimState, artifacts: RunArtifacts):
+    summary = state.build_summary()
+    artifacts.write_summary(summary)
+    if C.CONTROL_MODE == "rl" and RL_POLICY is not None and C.RL_TRAIN:
+        RL_POLICY.save()
+        print(f"[RL] saved weights to {C.RL_MODEL_PATH}")
+    metrics.close()
+    state._print_summary(summary)
+    print(f"\n[Run artifacts] {artifacts.run_dir}")
+
+
 def main():
+    global metrics, RL_POLICY
     pygame.init()
+    artifacts = RunArtifacts()
+    artifacts.write_config()
+    metrics = MetricsEngine(artifacts)
+    if C.CONTROL_MODE == "rl":
+        if (not C.RL_TRAIN) and (not os.path.exists(C.RL_MODEL_PATH)):
+            raise FileNotFoundError(
+                f"RL model not found at {C.RL_MODEL_PATH}. "
+                "Train first with --mode rl --rl-train."
+            )
+        RL_POLICY = TabularRLPolicy(C.RL_MODEL_PATH, training=C.RL_TRAIN)
+    else:
+        RL_POLICY = None
 
     # In headless mode we still need a minimal display init for pygame.font
     # and pygame.Surface to work, but we do NOT call set_mode().
@@ -1316,16 +1746,18 @@ def main():
     if HEADLESS:
         print(f"[HEADLESS]  mode={C.CONTROL_MODE}  seed={C.SEED}  "
               f"spawn_rate={C.SPAWN_RATE}  duration={C.DURATION}s  "
-              f"log={C.LOG_FILE if not C.DISABLE_LOG else 'disabled'}")
+              f"dt={C.FIXED_DT:.4f}s  out={artifacts.run_dir}")
+        if C.CONTROL_MODE == "rl":
+            print(f"[RL] train={C.RL_TRAIN} model={C.RL_MODEL_PATH}")
         try:
             while True:
-                state.update()
-                # No sleep — run as fast as possible.
-                # Signal threads use real time.sleep(1) so timing stays accurate.
+                done = state.update(C.FIXED_DT)
+                if done:
+                    print("\n[Simulation complete]")
+                    break
         except KeyboardInterrupt:
             pass
-        metrics.close()
-        state._print_summary()
+        _finalize_run(state, artifacts)
         return
 
     renderer = Renderer(state)
@@ -1333,8 +1765,7 @@ def main():
     while True:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                metrics.close()
-                state._print_summary()
+                _finalize_run(state, artifacts)
                 pygame.quit()
                 sys.exit()
             elif event.type == pygame.KEYDOWN:
@@ -1354,7 +1785,7 @@ def main():
                     C.SPAWN_INTERVAL = min(5.0, C.SPAWN_INTERVAL * 1.25)
                     print(f"[Spawn down] interval={C.SPAWN_INTERVAL:.2f}s")
                 elif k == pygame.K_F1:
-                    state._print_summary()
+                    state._print_summary(state.build_summary())
                 elif k == pygame.K_1:
                     renderer.cam_tx, renderer.cam_ty = 0.0, 0.0
                 elif k == pygame.K_2:
@@ -1368,8 +1799,13 @@ def main():
                     renderer.cam_ty = float(C.OFFSETS[3][1])
 
         keys = pygame.key.get_pressed()
-        state.update()
+        done = state.update(C.FIXED_DT)
         renderer.render(keys)
+        if done:
+            _finalize_run(state, artifacts)
+            print("\n[Simulation complete]")
+            pygame.quit()
+            sys.exit(0)
 
 
 if __name__ == "__main__":
