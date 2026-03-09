@@ -254,7 +254,7 @@ def main():
     parser.add_argument("--rl-epsilon", type=float, default=None)
     parser.add_argument("--rl-epsilon-min", type=float, default=None)
     parser.add_argument("--rl-epsilon-decay", type=float, default=None)
-    parser.add_argument("--neural-model-path", default="models/neural_greedy.pt")
+    parser.add_argument("--neural-model-path", default="models/neural_hybrid.pt")
     parser.add_argument(
         "--select-best-rl-from",
         "--auto-best-rl-from-experiment",
