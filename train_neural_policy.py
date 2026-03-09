@@ -15,6 +15,7 @@ FEATURE_COLUMNS = [
     "q_right", "q_down", "q_left", "q_up",
     "avg_wait_right", "avg_wait_down", "avg_wait_left", "avg_wait_up",
     "max_wait_right", "max_wait_down", "max_wait_left", "max_wait_up",
+    "downstream_right", "downstream_down", "downstream_left", "downstream_up",
 ]
 
 
@@ -45,14 +46,14 @@ def evaluate(model, X, y, loss_fn):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train-csv", default="data/neural/greedy_train.csv")
-    parser.add_argument("--val-csv", default="data/neural/greedy_val.csv")
-    parser.add_argument("--save-path", default="models/neural_greedy.pt")
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--train-csv", default="data/neural/hybrid_train.csv")
+    parser.add_argument("--val-csv", default="data/neural/hybrid_val.csv")
+    parser.add_argument("--save-path", default="models/neural_hybrid.pt")
+    parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--patience", type=int, default=12)
     parser.add_argument("--seed", type=int, default=123)
     args = parser.parse_args()
 

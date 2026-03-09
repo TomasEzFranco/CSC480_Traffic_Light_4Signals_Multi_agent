@@ -44,6 +44,7 @@ parser.add_argument("--rl-epsilon-decay", type=float, default=0.9995)
 parser.add_argument("--neural-model-path", default="models/neural_greedy.pt")
 parser.add_argument("--collect-neural-data", action="store_true")
 parser.add_argument("--neural-data-path", default="data/neural/greedy_data.csv")
+parser.add_argument("--teacher-policy", default="greedy", choices=["greedy", "hybrid"])
 args = parser.parse_args()
 
 HEADLESS = args.headless
@@ -110,6 +111,7 @@ class Config:
     NEURAL_MODEL_PATH = args.neural_model_path
     COLLECT_NEURAL_DATA = args.collect_neural_data
     NEURAL_DATA_PATH = args.neural_data_path
+    TEACHER_POLICY  = args.teacher_policy
 
     # Run params
     SEED             = args.seed
@@ -175,6 +177,19 @@ class Config:
     ADAPTIVE_W_STARVATION = 2.5
     ADAPTIVE_STARVATION_T = 45
 
+    # RL v2 tuning
+    RL_STARVATION_T       = 35.0
+    RL_W_QUEUE_DELTA      = 1.30
+    RL_W_WAIT_DELTA       = 0.030
+    RL_W_MAXWAIT_DELTA    = 0.22
+    RL_W_THROUGHPUT       = 0.75
+    RL_W_CUR_QUEUE        = 0.08
+    RL_W_CUR_WAIT_MASS    = 0.0015
+    RL_W_CUR_MAXWAIT      = 0.020
+    RL_W_IMBALANCE        = 0.08
+    RL_W_STARVED          = 0.35
+    RL_SWITCH_PENALTY     = 0.35
+
 C = Config()
 RNG = random.Random(C.SEED)
 
@@ -238,6 +253,7 @@ class RunArtifacts:
                 "neural_model_path": C.NEURAL_MODEL_PATH,
                 "collect_neural_data": C.COLLECT_NEURAL_DATA,
                 "neural_data_path": C.NEURAL_DATA_PATH,
+                "teacher_policy": C.TEACHER_POLICY,
                 "grid_rows": C.GRID_ROWS,
                 "grid_cols": C.GRID_COLS,
                 "run_id": self.run_id,
@@ -510,14 +526,17 @@ class TabularRLPolicy:
     def _key(self, state):
         return "|".join(str(x) for x in state)
 
-    def _ensure(self, key):
+    def _ensure(self, key, prior=None):
         if key not in self.q:
-            self.q[key] = [0.0, 0.0, 0.0, 0.0]
+            if prior is None:
+                self.q[key] = [0.0, 0.0, 0.0, 0.0]
+            else:
+                self.q[key] = [float(v) for v in prior]
         return self.q[key]
 
-    def act(self, state):
+    def act(self, state, prior=None):
         key = self._key(state)
-        values = self._ensure(key)
+        values = self._ensure(key, prior=prior)
         if self.training and RNG.random() < self.epsilon:
             return RNG.randint(0, 3)
         best = max(values)
@@ -576,6 +595,7 @@ class NeuralDataCollector:
                     "q_right", "q_down", "q_left", "q_up",
                     "avg_wait_right", "avg_wait_down", "avg_wait_left", "avg_wait_up",
                     "max_wait_right", "max_wait_down", "max_wait_left", "max_wait_up",
+                    "downstream_right", "downstream_down", "downstream_left", "downstream_up",
                     "action",
                 ])
                 self._header_written = True
@@ -619,6 +639,38 @@ class SignalController:
             avg_waits.append(sum(waits) / len(waits) if waits else 0.0)
             max_waits.append(max(waits) if waits else 0.0)
         return avg_waits, max_waits
+    
+    def get_downstream_totals(self, vehicles_state):
+        vals = []
+        row = self.iid // C.GRID_COLS
+        col = self.iid % C.GRID_COLS
+
+        for dn in range(4):
+            nr, nc = row, col
+            if dn == 0:
+                nc += 1
+            elif dn == 1:
+                nr += 1
+            elif dn == 2:
+                nc -= 1
+            else:
+                nr -= 1
+
+            if nr < 0 or nr >= C.GRID_ROWS or nc < 0 or nc >= C.GRID_COLS:
+                vals.append(0)
+                continue
+
+            nid = nr * C.GRID_COLS + nc
+            total = 0
+            for d in C.DIRECTION_NUMS.values():
+                for lane in range(3):
+                    total += sum(
+                        1 for v in vehicles_state[nid][d][lane]
+                        if v.crossed == 0
+                    )
+            vals.append(total)
+
+        return vals
 
     def get_state(self, signals_list, cur_green, cur_yellow, vehicles_state):
         iid    = self.iid
@@ -763,61 +815,258 @@ class RandomController(SignalController):
 
 class RLController(SignalController):
     """
-    Tabular Q-learning controller.
-    Action space: next phase in {0,1,2,3}.
-    State: (current_phase, bucketed queues for right/down/left/up).
+    Pressure- and delay-aware Q-learning controller.
+
+    Improvements over the original version:
+      - richer tabular state with queue, wait, pressure, and starvation summary
+      - heuristic-prior Q initialisation for unseen states
+      - shaped reward based on queue reduction, wait reduction, throughput,
+        imbalance, starvation, and switch cost
+      - explicit option to keep the current phase by selecting the same phase
+        again when green expires (handled in SimState._step_signals_one_second)
     """
     def __init__(self, iid):
         super().__init__(iid)
         self.prev_state = None
         self.prev_action = None
-        self.prev_queue_total = None
+        self.prev_metrics = None
+        self.prev_switched = False
+        self.last_served = {dn: 0.0 for dn in range(4)}
 
-    def _queues(self, vehicles_state):
-        iid = self.iid
-        return [
-            sum(1 for lane in range(3)
-                for v in vehicles_state[iid][C.DIRECTION_NUMS[dn]][lane]
-                if v.crossed == 0)
-            for dn in range(4)
-        ]
+    def _downstream_iid(self, dn):
+        row = self.iid // C.GRID_COLS
+        col = self.iid % C.GRID_COLS
+        if dn == 0:
+            col += 1
+        elif dn == 1:
+            row += 1
+        elif dn == 2:
+            col -= 1
+        else:
+            row -= 1
+        if row < 0 or row >= C.GRID_ROWS or col < 0 or col >= C.GRID_COLS:
+            return None
+        return row * C.GRID_COLS + col
 
-    def _state(self, vehicles_state, cur_green):
-        qs = self._queues(vehicles_state)
-        # 0-2,3-5,6-8,... keeps table size manageable.
-        binned = [min(q // 3, 8) for q in qs]
-        return (cur_green[self.iid], *binned)
+    def _downstream_totals(self, vehicles_state):
+        vals = []
+        for dn in range(4):
+            nid = self._downstream_iid(dn)
+            if nid is None:
+                vals.append(0)
+                continue
+            total = 0
+            for d in C.DIRECTION_NUMS.values():
+                for lane in range(3):
+                    total += sum(1 for v in vehicles_state[nid][d][lane] if v.crossed == 0)
+            vals.append(total)
+        return vals
+
+    def _collect_metrics(self, vehicles_state, cur_green, now_s):
+        queues = self.get_queue_lengths(vehicles_state)
+        avg_waits, max_waits = self.get_wait_stats(vehicles_state, now_s)
+        downstream = self._downstream_totals(vehicles_state)
+        pressures = [queues[i] - 0.35 * downstream[i] + 0.12 * avg_waits[i] for i in range(4)]
+        since_served = [now_s - self.last_served.get(i, 0.0) for i in range(4)]
+        total_q = sum(queues)
+        wait_mass = sum(q * w for q, w in zip(queues, avg_waits))
+        max_wait = max(max_waits) if max_waits else 0.0
+        imbalance = max(queues) - min(queues) if queues else 0
+        starved_count = sum(1 for t in since_served if t > C.RL_STARVATION_T)
+        dom_q = max(range(4), key=lambda i: (queues[i], avg_waits[i], -i))
+        dom_wait = max(range(4), key=lambda i: (avg_waits[i], queues[i], -i))
+        dom_pressure = max(range(4), key=lambda i: (pressures[i], avg_waits[i], -i))
+        starved_dir = 4 if max(since_served) <= C.RL_STARVATION_T else max(range(4), key=lambda i: since_served[i])
+        return {
+            "queues": queues,
+            "avg_waits": avg_waits,
+            "max_waits": max_waits,
+            "downstream": downstream,
+            "pressures": pressures,
+            "since_served": since_served,
+            "total_q": total_q,
+            "wait_mass": wait_mass,
+            "max_wait": max_wait,
+            "imbalance": imbalance,
+            "crossed": metrics.total_crossed[self.iid] if metrics is not None else 0,
+            "dom_q": dom_q,
+            "dom_wait": dom_wait,
+            "dom_pressure": dom_pressure,
+            "starved_dir": starved_dir,
+            "starved_count": starved_count,
+            "cur_phase": cur_green[self.iid],
+        }
+
+    def _state(self, m):
+        q_bucket = min(m["total_q"] // 4, 7)
+        max_wait_bucket = min(int(m["max_wait"] // 10), 7)
+        imbalance_bucket = min(int(m["imbalance"] // 2), 5)
+        cur_phase = m["cur_phase"]
+        cur_q_bucket = min(m["queues"][cur_phase] // 3, 5)
+        cur_wait_bucket = min(int(m["avg_waits"][cur_phase] // 8), 7)
+        return (
+            cur_phase,
+            m["dom_q"],
+            m["dom_wait"],
+            m["dom_pressure"],
+            q_bucket,
+            max_wait_bucket,
+            imbalance_bucket,
+            m["starved_dir"],
+            cur_q_bucket,
+            cur_wait_bucket,
+        )
+
+    def _prior_values(self, m):
+        vals = []
+        for a in range(4):
+            starvation_bonus = 1.5 if m["since_served"][a] > C.RL_STARVATION_T else 0.0
+            score = (
+                1.10 * m["queues"][a]
+                + 0.12 * m["avg_waits"][a]
+                + 0.05 * m["max_waits"][a]
+                + 0.85 * max(m["pressures"][a], 0.0)
+                + starvation_bonus
+            )
+            vals.append(score / 8.0)
+        return vals
+
+    def _reward(self, prev_m, cur_m):
+        delta_q = prev_m["total_q"] - cur_m["total_q"]
+        delta_wait = prev_m["wait_mass"] - cur_m["wait_mass"]
+        delta_max_wait = prev_m["max_wait"] - cur_m["max_wait"]
+        delta_cross = cur_m["crossed"] - prev_m["crossed"]
+        reward = (
+            C.RL_W_QUEUE_DELTA * delta_q
+            + C.RL_W_WAIT_DELTA * delta_wait
+            + C.RL_W_MAXWAIT_DELTA * delta_max_wait
+            + C.RL_W_THROUGHPUT * delta_cross
+            - C.RL_W_CUR_QUEUE * cur_m["total_q"]
+            - C.RL_W_CUR_WAIT_MASS * cur_m["wait_mass"]
+            - C.RL_W_CUR_MAXWAIT * cur_m["max_wait"]
+            - C.RL_W_IMBALANCE * cur_m["imbalance"]
+            - C.RL_W_STARVED * cur_m["starved_count"]
+        )
+        if self.prev_switched:
+            reward -= C.RL_SWITCH_PENALTY
+        return reward
 
     def choose_next_phase(self, vehicles_state, cur_green, now_s):
         global RL_POLICY
         if RL_POLICY is None:
             return RNG.randint(0, 3)
 
-        state = self._state(vehicles_state, cur_green)
-        q_total = sum(self._queues(vehicles_state))
-        if (self.prev_state is not None and self.prev_action is not None and
-                self.prev_queue_total is not None):
-            # Reward queue reduction while discouraging sustained congestion.
-            reward = (self.prev_queue_total - q_total) - 0.05 * q_total
+        metrics_now = self._collect_metrics(vehicles_state, cur_green, now_s)
+        state = self._state(metrics_now)
+        if self.prev_state is not None and self.prev_action is not None and self.prev_metrics is not None:
+            reward = self._reward(self.prev_metrics, metrics_now)
             RL_POLICY.update(self.prev_state, self.prev_action, reward, state)
 
-        action = RL_POLICY.act(state)
+        action = RL_POLICY.act(state, prior=self._prior_values(metrics_now))
         self.prev_state = state
         self.prev_action = action
-        self.prev_queue_total = q_total
+        self.prev_metrics = metrics_now
+        self.prev_switched = (action != cur_green[self.iid])
+        self.last_served[cur_green[self.iid]] = now_s
         return action
 
     def next_green_duration(self, signals_list, cur_green, vehicles_state, now_s):
-        iid = self.iid
-        d = C.DIRECTION_NUMS[cur_green[iid]]
-        q = sum(1 for lane in range(3)
-                for v in vehicles_state[iid][d][lane]
-                if v.crossed == 0)
-        return int(max(C.MIN_GREEN, min(C.MAX_GREEN, C.MIN_GREEN + q * 1.6)))
+        queues = self.get_queue_lengths(vehicles_state)
+        avg_waits, max_waits = self.get_wait_stats(vehicles_state, now_s)
+        cur = cur_green[self.iid]
+        q = queues[cur]
+        avg_w = avg_waits[cur]
+        max_w = max_waits[cur]
+        dur = C.MIN_GREEN + 1.25 * q + 0.10 * avg_w + 0.04 * max_w
+        return int(max(C.MIN_GREEN, min(C.MAX_GREEN, dur)))
+
+class HybridTeacherController(SignalController):
+
+    def __init__(self, iid):
+        super().__init__(iid)
+        self._last_green_time = {dn: 0.0 for dn in range(4)}
+
+    def _norm(self, x, cap):
+        return min(float(x), float(cap)) / float(cap)
+
+    def _score(self, dn, cur_phase, queues, avg_waits, max_waits, downstream, now_s):
+        since_served = now_s - self._last_green_time.get(dn, now_s)
+        starvation = max(0.0, since_served - 22.0)
+
+        # Soft downstream-aware pressure
+        pressure_raw = max(0.0, queues[dn] - 0.18 * downstream[dn])
+
+        q_n         = self._norm(queues[dn], 20)
+        avg_w_n     = self._norm(avg_waits[dn], 40)
+        max_w_n     = self._norm(max_waits[dn], 80)
+        down_n      = self._norm(downstream[dn], 20)
+        pressure_n  = self._norm(pressure_raw, 20)
+        starve_n    = self._norm(starvation, 40)
+
+        # Small hold bias for current phase if it is still competitive.
+        keep_bias = 0.0
+        if dn == cur_phase:
+            keep_bias = 0.10 + 0.05 * q_n
+
+        return (
+            1.30 * q_n
+            + 0.50 * avg_w_n
+            + 0.75 * max_w_n
+            + 0.60 * pressure_n
+            + 0.55 * starve_n
+            - 0.10 * down_n
+            + keep_bias
+        )
+
+    def choose_next_phase(self, vehicles_state, cur_green, now_s):
+        cur_phase = cur_green[self.iid]
+        self._last_green_time[cur_phase] = now_s
+
+        queues = self.get_queue_lengths(vehicles_state)
+        avg_waits, max_waits = self.get_wait_stats(vehicles_state, now_s)
+        downstream = self.get_downstream_totals(vehicles_state)
+
+        scores = [
+            self._score(dn, cur_phase, queues, avg_waits, max_waits, downstream, now_s)
+            for dn in range(4)
+        ]
+
+        # Deterministic tie-breaks reduce label noise for supervised learning.
+        best_dn = max(
+            range(4),
+            key=lambda dn: (
+                scores[dn],
+                max_waits[dn],
+                avg_waits[dn],
+                queues[dn],
+                -abs(dn - cur_phase),   # slightly prefer staying close to current if tied
+                -dn
+            )
+        )
+        return best_dn
+
+    def next_green_duration(self, signals_list, cur_green, vehicles_state, now_s):
+        cur = cur_green[self.iid]
+        queues = self.get_queue_lengths(vehicles_state)
+        avg_waits, max_waits = self.get_wait_stats(vehicles_state, now_s)
+        downstream = self.get_downstream_totals(vehicles_state)
+
+        q = queues[cur]
+        avg_w = avg_waits[cur]
+        max_w = max_waits[cur]
+        down = downstream[cur]
+
+        dur = (
+            C.MIN_GREEN
+            + 1.10 * q
+            + 0.08 * avg_w
+            + 0.03 * max_w
+            - 0.05 * down
+        )
+        return int(max(C.MIN_GREEN, min(C.MAX_GREEN, dur)))
 
 
 class NeuralController(SignalController):
-    """Supervised neural controller that predicts the next phase 0..3."""
     def __init__(self, iid):
         super().__init__(iid)
 
@@ -828,7 +1077,10 @@ class NeuralController(SignalController):
 
         queues = self.get_queue_lengths(vehicles_state)
         avg_waits, max_waits = self.get_wait_stats(vehicles_state, now_s)
-        feats = encode_features(cur_green[self.iid], queues, avg_waits, max_waits)
+        downstream = self.get_downstream_totals(vehicles_state)
+        feats = encode_features(
+            cur_green[self.iid], queues, avg_waits, max_waits, downstream
+        )
         x = torch.tensor([feats], dtype=torch.float32)
         with torch.no_grad():
             logits = NEURAL_POLICY(x)
@@ -836,12 +1088,24 @@ class NeuralController(SignalController):
         return action
 
     def next_green_duration(self, signals_list, cur_green, vehicles_state, now_s):
-        iid = self.iid
-        d = C.DIRECTION_NUMS[cur_green[iid]]
-        q = sum(1 for lane in range(3)
-                for v in vehicles_state[iid][d][lane]
-                if v.crossed == 0)
-        return int(max(C.MIN_GREEN, min(C.MAX_GREEN, C.MIN_GREEN + q * 1.6)))
+        cur = cur_green[self.iid]
+        queues = self.get_queue_lengths(vehicles_state)
+        avg_waits, max_waits = self.get_wait_stats(vehicles_state, now_s)
+        downstream = self.get_downstream_totals(vehicles_state)
+
+        q = queues[cur]
+        avg_w = avg_waits[cur]
+        max_w = max_waits[cur]
+        down = downstream[cur]
+
+        dur = (
+            C.MIN_GREEN
+            + 1.10 * q
+            + 0.08 * avg_w
+            + 0.03 * max_w
+            - 0.05 * down
+        )
+        return int(max(C.MIN_GREEN, min(C.MAX_GREEN, dur)))
 
 
 CONTROLLER_MAP = {
@@ -1212,6 +1476,12 @@ class SimState:
         ctrl_cls = CONTROLLER_MAP.get(C.CONTROL_MODE, AdaptiveController)
         self.controllers = [ctrl_cls(iid) for iid in range(C.NO_INTERSECTIONS)]
 
+        self.teacher_controllers = None
+        if C.COLLECT_NEURAL_DATA and C.TEACHER_POLICY == "hybrid":
+            self.teacher_controllers = [
+                HybridTeacherController(iid) for iid in range(C.NO_INTERSECTIONS)
+            ]
+
         # ---- Spawn stacks ----
         _spawn_x  = []
         _spawn_y  = []
@@ -1249,9 +1519,14 @@ class SimState:
         ts3 = TrafficSignal(C.DEFAULT_RED, C.DEFAULT_YELLOW, C.DEFAULT_GREEN[2])
         ts4 = TrafficSignal(C.DEFAULT_RED, C.DEFAULT_YELLOW, C.DEFAULT_GREEN[3])
         self.signals[iid] = [ts1, ts2, ts3, ts4]
+    
+    def _effective_controller(self, iid):
+        if self.teacher_controllers is not None:
+            return self.teacher_controllers[iid]
+        return self.controllers[iid]
 
     def _activate_green(self, iid):
-        ctrl = self.controllers[iid]
+        ctrl = self._effective_controller(iid)
         dur = int(max(C.MIN_GREEN, min(
             C.MAX_GREEN,
             ctrl.next_green_duration(
@@ -1297,22 +1572,43 @@ class SimState:
 
         if self.signals[iid][cg].green == 0:
             ctrl = self.controllers[iid]
-            if (C.COLLECT_NEURAL_DATA and C.CONTROL_MODE == "greedy"
-                    and NEURAL_DATA_COLLECTOR is not None):
-                queues = ctrl.get_queue_lengths(self.vehicles)
-                avg_waits, max_waits = ctrl.get_wait_stats(self.vehicles, self.sim_time)
+            teacher_ctrl = self._effective_controller(iid)
+
+            if C.COLLECT_NEURAL_DATA and NEURAL_DATA_COLLECTOR is not None:
+                queues = teacher_ctrl.get_queue_lengths(self.vehicles)
+                avg_waits, max_waits = teacher_ctrl.get_wait_stats(self.vehicles, self.sim_time)
+                downstream = teacher_ctrl.get_downstream_totals(self.vehicles)
+
                 feats = encode_features(
-                    self.cur_green[iid], queues, avg_waits, max_waits
+                    self.cur_green[iid], queues, avg_waits, max_waits, downstream
                 )
-                teacher_action = ctrl.choose_next_phase(
+                teacher_action = teacher_ctrl.choose_next_phase(
                     self.vehicles, self.cur_green, self.sim_time
                 )
                 NEURAL_DATA_COLLECTOR.append(feats, teacher_action)
-                self.next_green[iid] = teacher_action
+                chosen_phase = teacher_action
             else:
-                self.next_green[iid] = ctrl.choose_next_phase(
+                chosen_phase = ctrl.choose_next_phase(
                     self.vehicles, self.cur_green, self.sim_time
                 )
+
+            # RL v2 can explicitly keep the current phase by selecting the
+            # same phase again when green expires. Extend green immediately
+            # instead of paying an unnecessary yellow-switch penalty.
+            if chosen_phase == cg and (
+                C.CONTROL_MODE in ("rl", "neural") or C.COLLECT_NEURAL_DATA
+            ):
+                duration_ctrl = teacher_ctrl if (C.COLLECT_NEURAL_DATA and teacher_ctrl is not None) else ctrl
+                self.signals[iid][cg].green = int(max(
+                    C.MIN_GREEN,
+                    min(C.MAX_GREEN, duration_ctrl.next_green_duration(
+                        self.signals, self.cur_green, self.vehicles, self.sim_time
+                    ))
+                ))
+                self.signals[iid][cg].yellow = C.DEFAULT_YELLOW
+                return
+
+            self.next_green[iid] = chosen_phase
             self.cur_yellow[iid] = 1
             d_cur = C.DIRECTION_NUMS[cg]
             for lane in range(3):
@@ -1426,6 +1722,7 @@ class SimState:
                 "model_path": C.NEURAL_MODEL_PATH,
                 "collect_data": C.COLLECT_NEURAL_DATA,
                 "data_path": C.NEURAL_DATA_PATH,
+                "teacher_policy": C.TEACHER_POLICY,
             },
             "intersections": per,
             "overall": overall,
@@ -1881,6 +2178,7 @@ def main():
             print(f"[NEURAL] model={C.NEURAL_MODEL_PATH}")
         if C.COLLECT_NEURAL_DATA:
             print(f"[NEURAL DATA] collecting to {C.NEURAL_DATA_PATH}")
+            print(f"[TEACHER] policy={C.TEACHER_POLICY}")
         try:
             while True:
                 done = state.update(C.FIXED_DT)

@@ -1,0 +1,23 @@
+{
+  "mode": "rl",
+  "seed": 29,
+  "spawn_rate": 1.0,
+  "duration_s": 600,
+  "fixed_dt_s": 0.016666666666666666,
+  "headless": true,
+  "rl_model_path": "models/rl_boost_epoch.json",
+  "rl_train": true,
+  "rl_alpha": 0.2,
+  "rl_gamma": 0.95,
+  "rl_epsilon": 0.2,
+  "rl_epsilon_min": 0.02,
+  "rl_epsilon_decay": 0.9995,
+  "neural_model_path": "models/neural_greedy.pt",
+  "collect_neural_data": false,
+  "neural_data_path": "data/neural/greedy_data.csv",
+  "grid_rows": 2,
+  "grid_cols": 2,
+  "run_id": "rl_seed29_spawn1p00",
+  "experiment_id": "rl_boost_protocol_v1_train_e006",
+  "created_utc": "2026-03-09T03:22:59.790308+00:00"
+}

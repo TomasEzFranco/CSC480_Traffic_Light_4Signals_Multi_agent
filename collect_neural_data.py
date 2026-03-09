@@ -9,13 +9,14 @@ def parse_list(raw):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Collect supervised neural training data from greedy controller")
+    parser = argparse.ArgumentParser(description="Collect supervised neural training data from a configurable teacher policy")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--seeds", default="21,22,23,24,25,26,27,28,29,30")
     parser.add_argument("--spawn-rates", default="1.0")
     parser.add_argument("--duration", type=int, default=300)
     parser.add_argument("--dt", type=float, default=1.0 / 60.0)
-    parser.add_argument("--data-path", default="data/neural/greedy_train.csv")
+    parser.add_argument("--data-path", default="data/neural/hybrid_train.csv")
+    parser.add_argument("--teacher-policy", default="hybrid", choices=["greedy", "hybrid"])
     args = parser.parse_args()
 
     seeds = [int(x) for x in parse_list(args.seeds)]
@@ -37,6 +38,7 @@ def main():
                 "--dt", str(args.dt),
                 "--collect-neural-data",
                 "--neural-data-path", args.data_path,
+                "--teacher-policy", args.teacher_policy,
                 "--no-log",
             ]
             print("RUN:", " ".join(cmd))

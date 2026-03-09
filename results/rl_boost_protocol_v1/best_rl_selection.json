@@ -1,0 +1,24 @@
+{
+  "study_id": "rl_boost_protocol_v1",
+  "selected_epoch": 4,
+  "selected_model_path": "models\\epoch_snapshots\\rl_boost_protocol_v1\\epoch_004.json",
+  "selected_epoch_mean_metrics": {
+    "avg_wait_mean": 26.07973885165456,
+    "throughput_mean": 65.19999999998718,
+    "fairness_mean": 0.6276655213846232,
+    "red_light_violations_mean": 0.0
+  },
+  "reference_best_run_within_selected_epoch": {
+    "run_id": "rl_seed31_spawn1p00",
+    "avg_wait": 22.669682504381434,
+    "throughput": 65.99999999998703,
+    "fairness": 0.6380986010223298,
+    "red_light_violations": 0.0
+  },
+  "best_model_output": "models\\rl_boost_best.json",
+  "selection_rule": [
+    "lowest validation mean avg_wait across all validation seeds",
+    "then lowest validation mean red_light_violations",
+    "then highest validation mean throughput"
+  ]
+}
