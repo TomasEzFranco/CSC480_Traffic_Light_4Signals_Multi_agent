@@ -1,0 +1,1 @@
+elapsed_s,mode,seed,spawn_rate,iid,avg_wait_s,p95_wait_s,max_wait_s,avg_queue,max_queue,throughput_per_min,fairness_index,total_crossed,total_spawned,external_spawned,transferred_in,exited_world,red_light_violations,queue_right,queue_down,queue_left,queue_up
