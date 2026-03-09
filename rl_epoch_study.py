@@ -35,10 +35,6 @@ def run_cmd(cmd):
         raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(cmd)}")
 
 
-def run_id_for(seed, spawn):
-    return f"rl_seed{seed}_spawn{spawn:.2f}".replace(".", "p")
-
-
 def read_rows(path):
     with open(path, "r", encoding="utf-8") as f:
         return list(csv.DictReader(f))
@@ -60,18 +56,6 @@ def pick_best_row(rows):
             -as_float(r, "throughput"),
         ),
     )[0]
-
-
-def copy_epoch_snapshots(model_template, seeds, spawns, snapshot_dir):
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
-    for seed in seeds:
-        for spawn in spawns:
-            run_id = run_id_for(seed, spawn)
-            src = Path(model_template.format(mode="rl", seed=seed, spawn=spawn, run_id=run_id))
-            if not src.exists():
-                raise FileNotFoundError(f"missing trained model for epoch snapshot: {src}")
-            dst = snapshot_dir / f"{run_id}.json"
-            shutil.copy2(src, dst)
 
 
 def summarize_epoch(eval_summary_csv, epoch_idx):
@@ -148,7 +132,7 @@ def plot_run_lines(epoch_rows, out_path):
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
         ax.plot(xs, ys, marker="o", alpha=0.9, label=run_id)
-    ax.set_title("RL per-model avg_wait across epochs")
+    ax.set_title("RL validation avg_wait across epochs")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("avg_wait (iid=-1)")
     ax.grid(alpha=0.25)
@@ -174,23 +158,25 @@ def add_rl_hyperparams(cmd, args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train/evaluate RL across epochs, plot progress, and keep best model."
+        description="Train/evaluate a shared RL model across epochs with train/val/test seed splits."
     )
-    parser.add_argument("--study-id", default="rl_epoch_study_v1")
+    parser.add_argument("--study-id", default="rl_epoch_study_v2")
     parser.add_argument("--results-dir", default="results")
     parser.add_argument("--models-dir", default="models")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--seeds", default="42,43,44")
+    parser.add_argument("--train-seeds", default="21,22,23,24,25,26,27,28,29,30")
+    parser.add_argument("--val-seeds", default="31,32,33,34,35")
+    parser.add_argument("--test-seeds", default="41,42,43,44,45")
     parser.add_argument("--spawn-rates", default="1.0,2.0")
-    parser.add_argument("--duration-train", type=int, default=600)
+    parser.add_argument("--duration-train", type=int, default=300)
     parser.add_argument("--duration-eval", type=int, default=180)
     parser.add_argument("--dt", type=float, default=1.0 / 60.0)
     parser.add_argument("--no-log", action="store_true")
     parser.add_argument(
-        "--model-template",
-        default="models/rl_{seed}_{run_id}.json",
-        help="Persistent model path template for training across epochs.",
+        "--model-path",
+        default="models/rl_shared_epoch.json",
+        help="Single shared RL model path reused across all training runs.",
     )
     parser.add_argument(
         "--best-model-output",
@@ -207,8 +193,11 @@ def main():
     parser.add_argument("--compare-duration", type=int, default=180)
     args = parser.parse_args()
 
-    seeds = parse_int_list(args.seeds)
+    train_seeds = parse_int_list(args.train_seeds)
+    val_seeds = parse_int_list(args.val_seeds)
+    test_seeds = parse_int_list(args.test_seeds)
     spawns = parse_float_list(args.spawn_rates)
+
     study_dir = Path(args.results_dir) / args.study_id
     study_dir.mkdir(parents=True, exist_ok=True)
     archive_root = Path(args.models_dir) / "epoch_snapshots" / args.study_id
@@ -220,41 +209,44 @@ def main():
     for epoch in range(1, args.epochs + 1):
         ep = f"{epoch:03d}"
         train_exp = f"{args.study_id}_train_e{ep}"
-        eval_exp = f"{args.study_id}_eval_e{ep}"
-        snapshot_dir = archive_root / f"epoch_{ep}"
-        snapshot_template = str(snapshot_dir / "{run_id}.json")
+        eval_exp = f"{args.study_id}_val_e{ep}"
+        snapshot_path = archive_root / f"epoch_{ep}.json"
 
         train_cmd = [
             args.python,
             "run_experiments.py",
             "--modes", "rl",
-            "--seeds", args.seeds,
+            "--seeds", ",".join(str(s) for s in train_seeds),
             "--spawn-rates", args.spawn_rates,
             "--duration", str(args.duration_train),
             "--dt", str(args.dt),
             "--results-dir", args.results_dir,
             "--experiment-id", train_exp,
             "--rl-train",
-            "--rl-model-path", args.model_template,
+            "--rl-model-path", args.model_path,
         ]
         if args.no_log:
             train_cmd.append("--no-log")
         add_rl_hyperparams(train_cmd, args)
         run_cmd(train_cmd)
 
-        copy_epoch_snapshots(args.model_template, seeds, spawns, snapshot_dir)
+        model_path = Path(args.model_path)
+        if not model_path.exists():
+            raise FileNotFoundError(f"shared RL model was not written: {model_path}")
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(model_path, snapshot_path)
 
         eval_cmd = [
             args.python,
             "run_experiments.py",
             "--modes", "rl",
-            "--seeds", args.seeds,
+            "--seeds", ",".join(str(s) for s in val_seeds),
             "--spawn-rates", args.spawn_rates,
             "--duration", str(args.duration_eval),
             "--dt", str(args.dt),
             "--results-dir", args.results_dir,
             "--experiment-id", eval_exp,
-            "--rl-model-path", snapshot_template,
+            "--rl-model-path", str(snapshot_path),
         ]
         if args.no_log:
             eval_cmd.append("--no-log")
@@ -272,17 +264,17 @@ def main():
         print(
             "[epoch]",
             epoch,
-            f"mean_avg_wait={summary['avg_wait_mean']:.4f}",
-            f"mean_throughput={summary['throughput_mean']:.4f}",
-            f"mean_red={summary['red_light_violations_mean']:.4f}",
-            f"best_run={summary['best_run_id']}",
+            f"val_mean_avg_wait={summary['avg_wait_mean']:.4f}",
+            f"val_mean_throughput={summary['throughput_mean']:.4f}",
+            f"val_mean_red={summary['red_light_violations_mean']:.4f}",
+            f"best_val_run={summary['best_run_id']}",
         )
 
     epoch_csv = study_dir / "epoch_summary.csv"
     write_epoch_csv(epoch_csv, epoch_rows)
     print(f"[out] {epoch_csv}")
 
-    all_rows_path = study_dir / "all_eval_rows.csv"
+    all_rows_path = study_dir / "all_val_rows.csv"
     if all_eval_rows:
         fields = ["epoch"] + list(all_eval_rows[0].keys())[1:]
         with open(all_rows_path, "w", newline="", encoding="utf-8") as f:
@@ -294,30 +286,54 @@ def main():
     plot_epoch_means(epoch_rows, study_dir / "rl_epoch_metrics.png")
     plot_run_lines(epoch_rows, study_dir / "rl_epoch_run_comparison.png")
 
-    best_row = pick_best_row(all_eval_rows)
-    best_src = Path(best_row["rl_model_path"])
+        # Select the best EPOCH by validation means, not the single best validation run.
+    if not epoch_rows:
+        raise RuntimeError("no epoch summaries were produced")
+
+    ranked_epochs = sorted(
+        epoch_rows,
+        key=lambda r: (
+            float(r.get("avg_wait_mean", float("inf"))),
+            float(r.get("red_light_violations_mean", float("inf"))),
+            -float(r.get("throughput_mean", float("-inf"))),
+        ),
+    )
+    best_epoch_row = ranked_epochs[0]
+    selected_epoch = int(best_epoch_row["epoch"])
+    selected_epoch_str = f"{selected_epoch:03d}"
+    best_src = archive_root / f"epoch_{selected_epoch_str}.json"
     if not best_src.exists():
         raise FileNotFoundError(f"best model file missing: {best_src}")
     best_dst = Path(args.best_model_output)
     best_dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(best_src, best_dst)
 
+    # Keep track of the single best validation run inside the chosen epoch for reference only.
+    chosen_epoch_rows = [r for r in all_eval_rows if int(r["epoch"]) == selected_epoch]
+    best_run_in_epoch = pick_best_row(chosen_epoch_rows) if chosen_epoch_rows else None
+
     best_meta = {
         "study_id": args.study_id,
-        "selected_epoch": int(best_row["epoch"]),
-        "selected_run_id": best_row["run_id"],
+        "selected_epoch": selected_epoch,
         "selected_model_path": str(best_src),
-        "selected_metrics": {
-            "avg_wait": as_float(best_row, "avg_wait"),
-            "throughput": as_float(best_row, "throughput"),
-            "fairness": as_float(best_row, "fairness"),
-            "red_light_violations": as_float(best_row, "red_light_violations"),
+        "selected_epoch_mean_metrics": {
+            "avg_wait_mean": float(best_epoch_row["avg_wait_mean"]),
+            "throughput_mean": float(best_epoch_row["throughput_mean"]),
+            "fairness_mean": float(best_epoch_row["fairness_mean"]),
+            "red_light_violations_mean": float(best_epoch_row["red_light_violations_mean"]),
+        },
+        "reference_best_run_within_selected_epoch": None if best_run_in_epoch is None else {
+            "run_id": best_run_in_epoch["run_id"],
+            "avg_wait": as_float(best_run_in_epoch, "avg_wait"),
+            "throughput": as_float(best_run_in_epoch, "throughput"),
+            "fairness": as_float(best_run_in_epoch, "fairness"),
+            "red_light_violations": as_float(best_run_in_epoch, "red_light_violations"),
         },
         "best_model_output": str(best_dst),
         "selection_rule": [
-            "lowest avg_wait",
-            "then lowest red_light_violations",
-            "then highest throughput",
+            "lowest validation mean avg_wait across all validation seeds",
+            "then lowest validation mean red_light_violations",
+            "then highest validation mean throughput",
         ],
     }
     best_meta_path = study_dir / "best_rl_selection.json"
@@ -332,7 +348,7 @@ def main():
             args.python,
             "run_experiments.py",
             "--modes", args.compare_modes,
-            "--seeds", args.seeds,
+            "--seeds", ",".join(str(s) for s in test_seeds),
             "--spawn-rates", args.spawn_rates,
             "--duration", str(args.compare_duration),
             "--dt", str(args.dt),

@@ -25,7 +25,8 @@ def parse_float_list(raw):
 
 def run_one(py_cmd, mode, seed, spawn_rate, duration, dt, results_dir, exp_id,
             no_log, rl_model_path, rl_train, rl_alpha, rl_gamma,
-            rl_epsilon, rl_epsilon_min, rl_epsilon_decay):
+            rl_epsilon, rl_epsilon_min, rl_epsilon_decay,
+            neural_model_path):
     run_id = f"{mode}_seed{seed}_spawn{spawn_rate:.2f}".replace(".", "p")
     resolved_rl_model_path = rl_model_path.format(
         mode=mode,
@@ -60,6 +61,8 @@ def run_one(py_cmd, mode, seed, spawn_rate, duration, dt, results_dir, exp_id,
             cmd.extend(["--rl-epsilon-min", str(rl_epsilon_min)])
         if rl_epsilon_decay is not None:
             cmd.extend(["--rl-epsilon-decay", str(rl_epsilon_decay)])
+    if mode == "neural":
+        cmd.extend(["--neural-model-path", neural_model_path])
     if no_log:
         cmd.append("--no-log")
 
@@ -251,6 +254,7 @@ def main():
     parser.add_argument("--rl-epsilon", type=float, default=None)
     parser.add_argument("--rl-epsilon-min", type=float, default=None)
     parser.add_argument("--rl-epsilon-decay", type=float, default=None)
+    parser.add_argument("--neural-model-path", default="models/neural_greedy.pt")
     parser.add_argument(
         "--select-best-rl-from",
         "--auto-best-rl-from-experiment",
@@ -331,6 +335,7 @@ def main():
             args.rl_epsilon,
             args.rl_epsilon_min,
             args.rl_epsilon_decay,
+            args.neural_model_path,
         )
         all_rows.extend(flatten_summary(exp_id, run_id, summary))
 

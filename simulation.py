@@ -13,13 +13,17 @@ import argparse
 import json
 from datetime import datetime, timezone
 
+import torch
+from neural.model import load_model
+from neural.utils import encode_features
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(description="CSC 480 Traffic Simulation")
 parser.add_argument("--headless",   action="store_true")
 parser.add_argument("--mode",       default="adaptive",
-                    choices=["fixed", "adaptive", "greedy", "random", "rl"])
+                    choices=["fixed", "adaptive", "greedy", "random", "rl", "neural"])
 parser.add_argument("--seed",       type=int,   default=42)
 parser.add_argument("--duration",   type=int,   default=0)
 parser.add_argument("--spawn-rate", type=float, default=1.0)
@@ -37,6 +41,9 @@ parser.add_argument("--rl-gamma", type=float, default=0.95)
 parser.add_argument("--rl-epsilon", type=float, default=0.20)
 parser.add_argument("--rl-epsilon-min", type=float, default=0.02)
 parser.add_argument("--rl-epsilon-decay", type=float, default=0.9995)
+parser.add_argument("--neural-model-path", default="models/neural_greedy.pt")
+parser.add_argument("--collect-neural-data", action="store_true")
+parser.add_argument("--neural-data-path", default="data/neural/greedy_data.csv")
 args = parser.parse_args()
 
 HEADLESS = args.headless
@@ -100,6 +107,9 @@ class Config:
     RL_EPSILON       = args.rl_epsilon
     RL_EPSILON_MIN   = args.rl_epsilon_min
     RL_EPSILON_DECAY = args.rl_epsilon_decay
+    NEURAL_MODEL_PATH = args.neural_model_path
+    COLLECT_NEURAL_DATA = args.collect_neural_data
+    NEURAL_DATA_PATH = args.neural_data_path
 
     # Run params
     SEED             = args.seed
@@ -225,6 +235,9 @@ class RunArtifacts:
                 "rl_epsilon": C.RL_EPSILON,
                 "rl_epsilon_min": C.RL_EPSILON_MIN,
                 "rl_epsilon_decay": C.RL_EPSILON_DECAY,
+                "neural_model_path": C.NEURAL_MODEL_PATH,
+                "collect_neural_data": C.COLLECT_NEURAL_DATA,
+                "neural_data_path": C.NEURAL_DATA_PATH,
                 "grid_rows": C.GRID_ROWS,
                 "grid_cols": C.GRID_COLS,
                 "run_id": self.run_id,
@@ -543,6 +556,28 @@ class TabularRLPolicy:
 
 
 RL_POLICY = None
+NEURAL_POLICY = None
+NEURAL_DATA_COLLECTOR = None
+
+
+class NeuralDataCollector:
+    def __init__(self, path):
+        self.path = path
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self._header_written = os.path.exists(path) and os.path.getsize(path) > 0
+
+    def append(self, features, action):
+        write_header = not self._header_written
+        with open(self.path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow([
+                    "phase0", "phase1", "phase2", "phase3",
+                    "q_right", "q_down", "q_left", "q_up",
+                    "action",
+                ])
+                self._header_written = True
+            w.writerow(list(features) + [int(action)])
 
 # =============================================================================
 # SIGNAL CONTROLLERS
@@ -554,6 +589,15 @@ class SignalController:
     """
     def __init__(self, iid):
         self.iid = iid
+
+    def get_queue_lengths(self, vehicles_state):
+        iid = self.iid
+        return [
+            sum(1 for lane in range(3)
+                for v in vehicles_state[iid][C.DIRECTION_NUMS[dn]][lane]
+                if v.crossed == 0)
+            for dn in range(4)
+        ]
 
     def get_state(self, signals_list, cur_green, cur_yellow, vehicles_state):
         iid    = self.iid
@@ -751,12 +795,40 @@ class RLController(SignalController):
         return int(max(C.MIN_GREEN, min(C.MAX_GREEN, C.MIN_GREEN + q * 1.6)))
 
 
+class NeuralController(SignalController):
+    """Supervised neural controller that predicts the next phase 0..3."""
+    def __init__(self, iid):
+        super().__init__(iid)
+
+    def choose_next_phase(self, vehicles_state, cur_green, now_s):
+        global NEURAL_POLICY
+        if NEURAL_POLICY is None:
+            return RNG.randint(0, 3)
+
+        queues = self.get_queue_lengths(vehicles_state)
+        feats = encode_features(cur_green[self.iid], queues)
+        x = torch.tensor([feats], dtype=torch.float32)
+        with torch.no_grad():
+            logits = NEURAL_POLICY(x)
+            action = int(torch.argmax(logits, dim=1).item())
+        return action
+
+    def next_green_duration(self, signals_list, cur_green, vehicles_state, now_s):
+        iid = self.iid
+        d = C.DIRECTION_NUMS[cur_green[iid]]
+        q = sum(1 for lane in range(3)
+                for v in vehicles_state[iid][d][lane]
+                if v.crossed == 0)
+        return int(max(C.MIN_GREEN, min(C.MAX_GREEN, C.MIN_GREEN + q * 1.6)))
+
+
 CONTROLLER_MAP = {
     "fixed":    FixedTimeController,
     "adaptive": AdaptiveController,
     "greedy":   GreedyController,
     "random":   RandomController,
     "rl":       RLController,
+    "neural":   NeuralController,
 }
 
 # =============================================================================
@@ -1203,9 +1275,19 @@ class SimState:
 
         if self.signals[iid][cg].green == 0:
             ctrl = self.controllers[iid]
-            self.next_green[iid] = ctrl.choose_next_phase(
-                self.vehicles, self.cur_green, self.sim_time
-            )
+            if (C.COLLECT_NEURAL_DATA and C.CONTROL_MODE == "greedy"
+                    and NEURAL_DATA_COLLECTOR is not None):
+                queues = ctrl.get_queue_lengths(self.vehicles)
+                feats = encode_features(self.cur_green[iid], queues)
+                teacher_action = ctrl.choose_next_phase(
+                    self.vehicles, self.cur_green, self.sim_time
+                )
+                NEURAL_DATA_COLLECTOR.append(feats, teacher_action)
+                self.next_green[iid] = teacher_action
+            else:
+                self.next_green[iid] = ctrl.choose_next_phase(
+                    self.vehicles, self.cur_green, self.sim_time
+                )
             self.cur_yellow[iid] = 1
             d_cur = C.DIRECTION_NUMS[cg]
             for lane in range(3):
@@ -1315,6 +1397,11 @@ class SimState:
                 "epsilon": (RL_POLICY.epsilon if RL_POLICY is not None else None),
                 "updates": (RL_POLICY.updates if RL_POLICY is not None else 0),
             },
+            "neural": {
+                "model_path": C.NEURAL_MODEL_PATH,
+                "collect_data": C.COLLECT_NEURAL_DATA,
+                "data_path": C.NEURAL_DATA_PATH,
+            },
             "intersections": per,
             "overall": overall,
         }
@@ -1370,6 +1457,7 @@ class Renderer:
         "adaptive": (80,  230, 130),
         "random":   (230, 180, 60),
         "rl":       (245, 90, 90),
+        "neural":   (170, 110, 255),
     }
 
     def __init__(self, state: SimState):
@@ -1719,7 +1807,7 @@ def _finalize_run(state: SimState, artifacts: RunArtifacts):
 
 
 def main():
-    global metrics, RL_POLICY
+    global metrics, RL_POLICY, NEURAL_POLICY, NEURAL_DATA_COLLECTOR
     pygame.init()
     artifacts = RunArtifacts()
     artifacts.write_config()
@@ -1733,6 +1821,21 @@ def main():
         RL_POLICY = TabularRLPolicy(C.RL_MODEL_PATH, training=C.RL_TRAIN)
     else:
         RL_POLICY = None
+
+    if C.CONTROL_MODE == "neural":
+        if not os.path.exists(C.NEURAL_MODEL_PATH):
+            raise FileNotFoundError(
+                f"Neural model not found at {C.NEURAL_MODEL_PATH}. "
+                "Train first with train_neural_policy.py."
+            )
+        NEURAL_POLICY = load_model(C.NEURAL_MODEL_PATH)
+    else:
+        NEURAL_POLICY = None
+
+    if C.COLLECT_NEURAL_DATA:
+        NEURAL_DATA_COLLECTOR = NeuralDataCollector(C.NEURAL_DATA_PATH)
+    else:
+        NEURAL_DATA_COLLECTOR = None
 
     # In headless mode we still need a minimal display init for pygame.font
     # and pygame.Surface to work, but we do NOT call set_mode().
@@ -1749,6 +1852,10 @@ def main():
               f"dt={C.FIXED_DT:.4f}s  out={artifacts.run_dir}")
         if C.CONTROL_MODE == "rl":
             print(f"[RL] train={C.RL_TRAIN} model={C.RL_MODEL_PATH}")
+        if C.CONTROL_MODE == "neural":
+            print(f"[NEURAL] model={C.NEURAL_MODEL_PATH}")
+        if C.COLLECT_NEURAL_DATA:
+            print(f"[NEURAL DATA] collecting to {C.NEURAL_DATA_PATH}")
         try:
             while True:
                 done = state.update(C.FIXED_DT)
