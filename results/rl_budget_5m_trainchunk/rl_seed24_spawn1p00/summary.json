@@ -1,0 +1,142 @@
+{
+  "mode": "rl",
+  "seed": 24,
+  "spawn_rate": 1.0,
+  "duration_s": 300.00059999995244,
+  "fixed_dt_s": 0.0166667,
+  "rl": {
+    "model_path": "models/rl_budget_5m.json",
+    "training": true,
+    "epsilon": 0.09791213547564491,
+    "updates": 73
+  },
+  "neural": {
+    "model_path": "models/neural_greedy.pt",
+    "collect_data": false,
+    "data_path": "data/neural/greedy_data.csv",
+    "teacher_policy": "greedy"
+  },
+  "intersections": [
+    {
+      "avg_wait": 38.33507666999121,
+      "avg_wait_right": 28.81339095999356,
+      "avg_wait_down": 32.47988952103113,
+      "avg_wait_left": 49.54343241999219,
+      "avg_wait_up": 34.96389106584908,
+      "p95_wait": 113.10022620001229,
+      "max_wait": 146.16695899994085,
+      "throughput": 17.59996480007319,
+      "avg_queue": 13.903333333333334,
+      "max_queue": 26,
+      "queues": [
+        4,
+        10,
+        8,
+        0
+      ],
+      "crossed": 88,
+      "spawned": 110,
+      "external_spawned": 76,
+      "transferred_in": 34,
+      "exited_world": 67,
+      "red_light_violations": 0,
+      "fairness": 0.6722222222222223,
+      "iid": 0
+    },
+    {
+      "avg_wait": 37.24613183977962,
+      "avg_wait_right": 40.00293714856158,
+      "avg_wait_down": 38.585164889464615,
+      "avg_wait_left": 17.34447913333045,
+      "avg_wait_up": 41.575391792594665,
+      "p95_wait": 110.25022049993694,
+      "max_wait": 140.36694740001525,
+      "throughput": 16.999966000070692,
+      "avg_queue": 10.858333333333333,
+      "max_queue": 21,
+      "queues": [
+        0,
+        5,
+        0,
+        3
+      ],
+      "crossed": 85,
+      "spawned": 93,
+      "external_spawned": 71,
+      "transferred_in": 22,
+      "exited_world": 57,
+      "red_light_violations": 0,
+      "fairness": 0.47058823529411764,
+      "iid": 1
+    },
+    {
+      "avg_wait": 33.69948768868936,
+      "avg_wait_right": 31.42307871903805,
+      "avg_wait_down": 38.61825905453375,
+      "avg_wait_left": 40.24782824323889,
+      "avg_wait_up": 18.8326765541677,
+      "p95_wait": 86.08350550000935,
+      "max_wait": 103.30020660001122,
+      "throughput": 18.999962000079012,
+      "avg_queue": 13.88,
+      "max_queue": 24,
+      "queues": [
+        1,
+        12,
+        5,
+        2
+      ],
+      "crossed": 95,
+      "spawned": 115,
+      "external_spawned": 92,
+      "transferred_in": 23,
+      "exited_world": 53,
+      "red_light_violations": 0,
+      "fairness": 0.5747126436781609,
+      "iid": 2
+    },
+    {
+      "avg_wait": 35.21035410850387,
+      "avg_wait_right": 35.286939260591986,
+      "avg_wait_down": 43.67211115357253,
+      "avg_wait_left": 23.853172706247634,
+      "avg_wait_up": 31.813789117637384,
+      "p95_wait": 96.9668605999986,
+      "max_wait": 130.56692780001418,
+      "throughput": 16.799966400069863,
+      "avg_queue": 9.243333333333334,
+      "max_queue": 22,
+      "queues": [
+        1,
+        1,
+        2,
+        6
+      ],
+      "crossed": 84,
+      "spawned": 94,
+      "external_spawned": 61,
+      "transferred_in": 33,
+      "exited_world": 47,
+      "red_light_violations": 0,
+      "fairness": 0.5952380952380952,
+      "iid": 3
+    }
+  ],
+  "overall": {
+    "avg_wait": 36.12276257674102,
+    "avg_wait_right": 33.88158652204629,
+    "avg_wait_down": 38.33885615465051,
+    "avg_wait_left": 32.74722812570229,
+    "avg_wait_up": 31.796437132562207,
+    "p95_wait": 101.6002031999893,
+    "throughput": 70.39985920029275,
+    "avg_queue": 11.971250000000001,
+    "fairness": 0.578190299108149,
+    "crossed": 352,
+    "spawned": 412,
+    "external_spawned": 300,
+    "transferred_in": 112,
+    "exited_world": 224,
+    "red_light_violations": 0
+  }
+}
