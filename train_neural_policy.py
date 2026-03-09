@@ -5,8 +5,17 @@ import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 
 from neural.model import NeuralPhasePolicy, save_model
+
+
+FEATURE_COLUMNS = [
+    "phase0", "phase1", "phase2", "phase3",
+    "q_right", "q_down", "q_left", "q_up",
+    "avg_wait_right", "avg_wait_down", "avg_wait_left", "avg_wait_up",
+    "max_wait_right", "max_wait_down", "max_wait_left", "max_wait_up",
+]
 
 
 def load_csv(path):
@@ -14,16 +23,7 @@ def load_csv(path):
     with open(path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            feats = [
-                float(row["phase0"]),
-                float(row["phase1"]),
-                float(row["phase2"]),
-                float(row["phase3"]),
-                float(row["q_right"]),
-                float(row["q_down"]),
-                float(row["q_left"]),
-                float(row["q_up"]),
-            ]
+            feats = [float(row[c]) for c in FEATURE_COLUMNS]
             label = int(row["action"])
             X.append(feats)
             y.append(label)
@@ -34,13 +34,25 @@ def accuracy(logits, y):
     return (logits.argmax(dim=1) == y).float().mean().item()
 
 
+def evaluate(model, X, y, loss_fn):
+    model.eval()
+    with torch.no_grad():
+        logits = model(X)
+        loss = loss_fn(logits, y).item()
+        acc = accuracy(logits, y)
+    return loss, acc
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Train supervised neural phase policy")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--train-csv", default="data/neural/greedy_train.csv")
     parser.add_argument("--val-csv", default="data/neural/greedy_val.csv")
     parser.add_argument("--save-path", default="models/neural_greedy.pt")
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--seed", type=int, default=123)
     args = parser.parse_args()
 
@@ -60,34 +72,56 @@ def main():
     loss_fn = nn.CrossEntropyLoss(weight=weights)
 
     model = NeuralPhasePolicy()
-    opt = optim.Adam(model.parameters(), lr=args.lr)
+    opt = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    dataset = TensorDataset(X_train, y_train)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
     best_val_acc = -1.0
     best_state = None
+    epochs_without_improve = 0
+
+    print("train class counts:", counts.tolist())
 
     for epoch in range(args.epochs):
         model.train()
-        logits = model(X_train)
-        loss = loss_fn(logits, y_train)
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
+        train_loss_sum = 0.0
+        train_correct = 0
+        train_total = 0
 
-        model.eval()
-        with torch.no_grad():
-            train_acc = accuracy(model(X_train), y_train)
-            val_acc = accuracy(model(X_val), y_val)
+        for xb, yb in loader:
+            logits = model(xb)
+            loss = loss_fn(logits, yb)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            train_loss_sum += loss.item() * xb.size(0)
+            train_correct += (logits.argmax(dim=1) == yb).sum().item()
+            train_total += xb.size(0)
+
+        train_loss = train_loss_sum / max(train_total, 1)
+        train_acc = train_correct / max(train_total, 1)
+        val_loss, val_acc = evaluate(model, X_val, y_val, loss_fn)
 
         print(
             f"epoch {epoch+1:02d} "
-            f"loss={loss.item():.4f} "
+            f"train_loss={train_loss:.4f} "
             f"train_acc={train_acc:.4f} "
+            f"val_loss={val_loss:.4f} "
             f"val_acc={val_acc:.4f}"
         )
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            epochs_without_improve = 0
+        else:
+            epochs_without_improve += 1
+
+        if epochs_without_improve >= args.patience:
+            print(f"early stopping after epoch {epoch+1}")
+            break
 
     model.load_state_dict(best_state)
     save_model(model, args.save_path)

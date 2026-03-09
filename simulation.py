@@ -574,6 +574,8 @@ class NeuralDataCollector:
                 w.writerow([
                     "phase0", "phase1", "phase2", "phase3",
                     "q_right", "q_down", "q_left", "q_up",
+                    "avg_wait_right", "avg_wait_down", "avg_wait_left", "avg_wait_up",
+                    "max_wait_right", "max_wait_down", "max_wait_left", "max_wait_up",
                     "action",
                 ])
                 self._header_written = True
@@ -598,6 +600,25 @@ class SignalController:
                 if v.crossed == 0)
             for dn in range(4)
         ]
+
+    def get_wait_stats(self, vehicles_state, now_s):
+        iid = self.iid
+        avg_waits = []
+        max_waits = []
+        for dn in range(4):
+            direction = C.DIRECTION_NUMS[dn]
+            waits = []
+            for lane in range(3):
+                for v in vehicles_state[iid][direction][lane]:
+                    if v.crossed != 0:
+                        continue
+                    w = v.total_wait_s
+                    if v.waiting and v.wait_start is not None:
+                        w += max(0.0, now_s - v.wait_start)
+                    waits.append(w)
+            avg_waits.append(sum(waits) / len(waits) if waits else 0.0)
+            max_waits.append(max(waits) if waits else 0.0)
+        return avg_waits, max_waits
 
     def get_state(self, signals_list, cur_green, cur_yellow, vehicles_state):
         iid    = self.iid
@@ -806,7 +827,8 @@ class NeuralController(SignalController):
             return RNG.randint(0, 3)
 
         queues = self.get_queue_lengths(vehicles_state)
-        feats = encode_features(cur_green[self.iid], queues)
+        avg_waits, max_waits = self.get_wait_stats(vehicles_state, now_s)
+        feats = encode_features(cur_green[self.iid], queues, avg_waits, max_waits)
         x = torch.tensor([feats], dtype=torch.float32)
         with torch.no_grad():
             logits = NEURAL_POLICY(x)
@@ -1278,7 +1300,10 @@ class SimState:
             if (C.COLLECT_NEURAL_DATA and C.CONTROL_MODE == "greedy"
                     and NEURAL_DATA_COLLECTOR is not None):
                 queues = ctrl.get_queue_lengths(self.vehicles)
-                feats = encode_features(self.cur_green[iid], queues)
+                avg_waits, max_waits = ctrl.get_wait_stats(self.vehicles, self.sim_time)
+                feats = encode_features(
+                    self.cur_green[iid], queues, avg_waits, max_waits
+                )
                 teacher_action = ctrl.choose_next_phase(
                     self.vehicles, self.cur_green, self.sim_time
                 )

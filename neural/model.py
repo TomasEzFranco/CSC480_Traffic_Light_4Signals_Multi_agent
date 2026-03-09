@@ -1,7 +1,8 @@
+import os
 import torch
 import torch.nn as nn
 
-INPUT_DIM = 8
+INPUT_DIM = 16
 NUM_CLASSES = 4
 
 
@@ -9,11 +10,11 @@ class NeuralPhasePolicy(nn.Module):
     def __init__(self, input_dim=INPUT_DIM, num_classes=NUM_CLASSES):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 64),
+            nn.Linear(input_dim, 128),
             nn.ReLU(),
-            nn.Linear(64, 64),
+            nn.Linear(128, 128),
             nn.ReLU(),
-            nn.Linear(64, num_classes),
+            nn.Linear(128, num_classes),
         )
 
     def forward(self, x):
@@ -21,6 +22,7 @@ class NeuralPhasePolicy(nn.Module):
 
 
 def save_model(model, path):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     torch.save(model.state_dict(), path)
 
 
