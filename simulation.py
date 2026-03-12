@@ -31,6 +31,8 @@ parser.add_argument("--log",        default="metrics.csv")
 parser.add_argument("--no-log",     action="store_true")
 parser.add_argument("--legacy-log", action="store_true")
 parser.add_argument("--dt",         type=float, default=1.0 / 60.0)
+parser.add_argument("--fixed-green-seconds", type=int, default=9)
+parser.add_argument("--shared-green-seconds", type=int, default=3)
 parser.add_argument("--results-dir", default="results")
 parser.add_argument("--experiment-id", default="")
 parser.add_argument("--run-id",       default="")
@@ -41,6 +43,17 @@ parser.add_argument("--rl-gamma", type=float, default=0.95)
 parser.add_argument("--rl-epsilon", type=float, default=0.20)
 parser.add_argument("--rl-epsilon-min", type=float, default=0.02)
 parser.add_argument("--rl-epsilon-decay", type=float, default=0.9995)
+parser.add_argument("--rl-starvation-t", type=float, default=None)
+parser.add_argument("--rl-w-queue-delta", type=float, default=None)
+parser.add_argument("--rl-w-wait-delta", type=float, default=None)
+parser.add_argument("--rl-w-maxwait-delta", type=float, default=None)
+parser.add_argument("--rl-w-throughput", type=float, default=None)
+parser.add_argument("--rl-w-cur-queue", type=float, default=None)
+parser.add_argument("--rl-w-cur-wait-mass", type=float, default=None)
+parser.add_argument("--rl-w-cur-maxwait", type=float, default=None)
+parser.add_argument("--rl-w-imbalance", type=float, default=None)
+parser.add_argument("--rl-w-starved", type=float, default=None)
+parser.add_argument("--rl-switch-penalty", type=float, default=None)
 parser.add_argument("--neural-model-path", default="models/neural_hybrid.pt")
 parser.add_argument("--collect-neural-data", action="store_true")
 parser.add_argument("--neural-data-path", default="data/neural/greedy_data.csv")
@@ -65,10 +78,17 @@ class Config:
     NO_INTERSECTIONS = 4
 
     # Signal timing
-    DEFAULT_GREEN    = {0: 10, 1: 10, 2: 10, 3: 10}
+    FIXED_GREEN_SECONDS = max(1, args.fixed_green_seconds)
+    SHARED_GREEN_SECONDS = max(1, args.shared_green_seconds)
+    DEFAULT_GREEN    = {
+        0: FIXED_GREEN_SECONDS,
+        1: FIXED_GREEN_SECONDS,
+        2: FIXED_GREEN_SECONDS,
+        3: FIXED_GREEN_SECONDS,
+    }
     DEFAULT_RED      = 150
-    DEFAULT_YELLOW   = 5
-    MIN_GREEN        = 5
+    DEFAULT_YELLOW   = 3
+    MIN_GREEN        = 3
     MAX_GREEN        = 30
 
     # Physics
@@ -108,6 +128,23 @@ class Config:
     RL_EPSILON       = args.rl_epsilon
     RL_EPSILON_MIN   = args.rl_epsilon_min
     RL_EPSILON_DECAY = args.rl_epsilon_decay
+    RL_STARVATION_T  = args.rl_starvation_t if args.rl_starvation_t is not None else 35.0
+    RL_W_QUEUE_DELTA = args.rl_w_queue_delta if args.rl_w_queue_delta is not None else 1.30
+    RL_W_WAIT_DELTA = args.rl_w_wait_delta if args.rl_w_wait_delta is not None else 0.030
+    RL_W_MAXWAIT_DELTA = (
+        args.rl_w_maxwait_delta if args.rl_w_maxwait_delta is not None else 0.22
+    )
+    RL_W_THROUGHPUT = args.rl_w_throughput if args.rl_w_throughput is not None else 1.10
+    RL_W_CUR_QUEUE = args.rl_w_cur_queue if args.rl_w_cur_queue is not None else 0.08
+    RL_W_CUR_WAIT_MASS = (
+        args.rl_w_cur_wait_mass if args.rl_w_cur_wait_mass is not None else 0.0015
+    )
+    RL_W_CUR_MAXWAIT = args.rl_w_cur_maxwait if args.rl_w_cur_maxwait is not None else 0.020
+    RL_W_IMBALANCE = args.rl_w_imbalance if args.rl_w_imbalance is not None else 0.08
+    RL_W_STARVED = args.rl_w_starved if args.rl_w_starved is not None else 0.35
+    RL_SWITCH_PENALTY = (
+        args.rl_switch_penalty if args.rl_switch_penalty is not None else 0.15
+    )
     NEURAL_MODEL_PATH = args.neural_model_path
     COLLECT_NEURAL_DATA = args.collect_neural_data
     NEURAL_DATA_PATH = args.neural_data_path
@@ -177,19 +214,6 @@ class Config:
     ADAPTIVE_W_STARVATION = 2.5
     ADAPTIVE_STARVATION_T = 45
 
-    # RL v2 tuning
-    RL_STARVATION_T       = 35.0
-    RL_W_QUEUE_DELTA      = 1.30
-    RL_W_WAIT_DELTA       = 0.030
-    RL_W_MAXWAIT_DELTA    = 0.22
-    RL_W_THROUGHPUT       = 0.75
-    RL_W_CUR_QUEUE        = 0.08
-    RL_W_CUR_WAIT_MASS    = 0.0015
-    RL_W_CUR_MAXWAIT      = 0.020
-    RL_W_IMBALANCE        = 0.08
-    RL_W_STARVED          = 0.35
-    RL_SWITCH_PENALTY     = 0.35
-
 C = Config()
 RNG = random.Random(C.SEED)
 
@@ -243,6 +267,8 @@ class RunArtifacts:
                 "duration_s": C.DURATION,
                 "fixed_dt_s": C.FIXED_DT,
                 "headless": HEADLESS,
+                "fixed_green_seconds": C.FIXED_GREEN_SECONDS,
+                "shared_green_seconds": C.SHARED_GREEN_SECONDS,
                 "rl_model_path": C.RL_MODEL_PATH,
                 "rl_train": C.RL_TRAIN,
                 "rl_alpha": C.RL_ALPHA,
@@ -250,6 +276,17 @@ class RunArtifacts:
                 "rl_epsilon": C.RL_EPSILON,
                 "rl_epsilon_min": C.RL_EPSILON_MIN,
                 "rl_epsilon_decay": C.RL_EPSILON_DECAY,
+                "rl_starvation_t": C.RL_STARVATION_T,
+                "rl_w_queue_delta": C.RL_W_QUEUE_DELTA,
+                "rl_w_wait_delta": C.RL_W_WAIT_DELTA,
+                "rl_w_maxwait_delta": C.RL_W_MAXWAIT_DELTA,
+                "rl_w_throughput": C.RL_W_THROUGHPUT,
+                "rl_w_cur_queue": C.RL_W_CUR_QUEUE,
+                "rl_w_cur_wait_mass": C.RL_W_CUR_WAIT_MASS,
+                "rl_w_cur_maxwait": C.RL_W_CUR_MAXWAIT,
+                "rl_w_imbalance": C.RL_W_IMBALANCE,
+                "rl_w_starved": C.RL_W_STARVED,
+                "rl_switch_penalty": C.RL_SWITCH_PENALTY,
                 "neural_model_path": C.NEURAL_MODEL_PATH,
                 "collect_neural_data": C.COLLECT_NEURAL_DATA,
                 "neural_data_path": C.NEURAL_DATA_PATH,
@@ -1524,15 +1561,20 @@ class SimState:
         if self.teacher_controllers is not None:
             return self.teacher_controllers[iid]
         return self.controllers[iid]
-
-    def _activate_green(self, iid):
-        ctrl = self._effective_controller(iid)
-        dur = int(max(C.MIN_GREEN, min(
+    
+    def _compute_green_duration(self, iid, ctrl):
+        if C.CONTROL_MODE != "fixed":
+            return int(max(C.MIN_GREEN, min(C.MAX_GREEN, C.SHARED_GREEN_SECONDS)))
+        return int(max(C.MIN_GREEN, min(
             C.MAX_GREEN,
             ctrl.next_green_duration(
                 self.signals, self.cur_green, self.vehicles, self.sim_time
             )
         )))
+
+    def _activate_green(self, iid):
+        ctrl = self._effective_controller(iid)
+        dur = self._compute_green_duration(iid, ctrl)
         self.signals[iid][self.cur_green[iid]].green = dur
         self.signals[iid][self.cur_green[iid]].yellow = C.DEFAULT_YELLOW
         ng = self.next_green[iid]
@@ -1592,19 +1634,11 @@ class SimState:
                     self.vehicles, self.cur_green, self.sim_time
                 )
 
-            # RL v2 can explicitly keep the current phase by selecting the
-            # same phase again when green expires. Extend green immediately
-            # instead of paying an unnecessary yellow-switch penalty.
-            if chosen_phase == cg and (
-                C.CONTROL_MODE in ("rl", "neural") or C.COLLECT_NEURAL_DATA
-            ):
+            # If the controller keeps the same phase, extend green directly.
+            # Yellow is only required when switching to a different phase.
+            if chosen_phase == cg:
                 duration_ctrl = teacher_ctrl if (C.COLLECT_NEURAL_DATA and teacher_ctrl is not None) else ctrl
-                self.signals[iid][cg].green = int(max(
-                    C.MIN_GREEN,
-                    min(C.MAX_GREEN, duration_ctrl.next_green_duration(
-                        self.signals, self.cur_green, self.vehicles, self.sim_time
-                    ))
-                ))
+                self.signals[iid][cg].green = self._compute_green_duration(iid, duration_ctrl)
                 self.signals[iid][cg].yellow = C.DEFAULT_YELLOW
                 return
 

@@ -156,6 +156,31 @@ def add_rl_hyperparams(cmd, args):
         cmd.extend(["--rl-epsilon-decay", str(args.rl_epsilon_decay)])
 
 
+def add_rl_reward_params(cmd, args):
+    if args.rl_starvation_t is not None:
+        cmd.extend(["--rl-starvation-t", str(args.rl_starvation_t)])
+    if args.rl_w_queue_delta is not None:
+        cmd.extend(["--rl-w-queue-delta", str(args.rl_w_queue_delta)])
+    if args.rl_w_wait_delta is not None:
+        cmd.extend(["--rl-w-wait-delta", str(args.rl_w_wait_delta)])
+    if args.rl_w_maxwait_delta is not None:
+        cmd.extend(["--rl-w-maxwait-delta", str(args.rl_w_maxwait_delta)])
+    if args.rl_w_throughput is not None:
+        cmd.extend(["--rl-w-throughput", str(args.rl_w_throughput)])
+    if args.rl_w_cur_queue is not None:
+        cmd.extend(["--rl-w-cur-queue", str(args.rl_w_cur_queue)])
+    if args.rl_w_cur_wait_mass is not None:
+        cmd.extend(["--rl-w-cur-wait-mass", str(args.rl_w_cur_wait_mass)])
+    if args.rl_w_cur_maxwait is not None:
+        cmd.extend(["--rl-w-cur-maxwait", str(args.rl_w_cur_maxwait)])
+    if args.rl_w_imbalance is not None:
+        cmd.extend(["--rl-w-imbalance", str(args.rl_w_imbalance)])
+    if args.rl_w_starved is not None:
+        cmd.extend(["--rl-w-starved", str(args.rl_w_starved)])
+    if args.rl_switch_penalty is not None:
+        cmd.extend(["--rl-switch-penalty", str(args.rl_switch_penalty)])
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train/evaluate a shared RL model across epochs with train/val/test seed splits."
@@ -188,6 +213,17 @@ def main():
     parser.add_argument("--rl-epsilon", type=float, default=None)
     parser.add_argument("--rl-epsilon-min", type=float, default=None)
     parser.add_argument("--rl-epsilon-decay", type=float, default=None)
+    parser.add_argument("--rl-starvation-t", type=float, default=None)
+    parser.add_argument("--rl-w-queue-delta", type=float, default=None)
+    parser.add_argument("--rl-w-wait-delta", type=float, default=None)
+    parser.add_argument("--rl-w-maxwait-delta", type=float, default=None)
+    parser.add_argument("--rl-w-throughput", type=float, default=None)
+    parser.add_argument("--rl-w-cur-queue", type=float, default=None)
+    parser.add_argument("--rl-w-cur-wait-mass", type=float, default=None)
+    parser.add_argument("--rl-w-cur-maxwait", type=float, default=None)
+    parser.add_argument("--rl-w-imbalance", type=float, default=None)
+    parser.add_argument("--rl-w-starved", type=float, default=None)
+    parser.add_argument("--rl-switch-penalty", type=float, default=None)
     parser.add_argument("--run-compare", action="store_true")
     parser.add_argument("--compare-modes", default="fixed,greedy,adaptive,random,rl")
     parser.add_argument("--compare-duration", type=int, default=180)
@@ -228,6 +264,7 @@ def main():
         if args.no_log:
             train_cmd.append("--no-log")
         add_rl_hyperparams(train_cmd, args)
+        add_rl_reward_params(train_cmd, args)
         run_cmd(train_cmd)
 
         model_path = Path(args.model_path)
@@ -251,6 +288,7 @@ def main():
         if args.no_log:
             eval_cmd.append("--no-log")
         add_rl_hyperparams(eval_cmd, args)
+        add_rl_reward_params(eval_cmd, args)
         run_cmd(eval_cmd)
 
         eval_summary = Path(args.results_dir) / eval_exp / "summary.csv"
@@ -358,6 +396,7 @@ def main():
         ]
         if args.no_log:
             compare_cmd.append("--no-log")
+        add_rl_reward_params(compare_cmd, args)
         run_cmd(compare_cmd)
         run_cmd([
             args.python,

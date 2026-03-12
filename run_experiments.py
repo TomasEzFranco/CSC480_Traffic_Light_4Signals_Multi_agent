@@ -26,6 +26,10 @@ def parse_float_list(raw):
 def run_one(py_cmd, mode, seed, spawn_rate, duration, dt, results_dir, exp_id,
             no_log, rl_model_path, rl_train, rl_alpha, rl_gamma,
             rl_epsilon, rl_epsilon_min, rl_epsilon_decay,
+            rl_starvation_t, rl_w_queue_delta, rl_w_wait_delta, rl_w_maxwait_delta,
+            rl_w_throughput, rl_w_cur_queue, rl_w_cur_wait_mass, rl_w_cur_maxwait,
+            rl_w_imbalance, rl_w_starved, rl_switch_penalty,
+            fixed_green_seconds, shared_green_seconds,
             neural_model_path):
     run_id = f"{mode}_seed{seed}_spawn{spawn_rate:.2f}".replace(".", "p")
     resolved_rl_model_path = rl_model_path.format(
@@ -43,6 +47,8 @@ def run_one(py_cmd, mode, seed, spawn_rate, duration, dt, results_dir, exp_id,
         "--spawn-rate", str(spawn_rate),
         "--duration", str(duration),
         "--dt", str(dt),
+        "--fixed-green-seconds", str(fixed_green_seconds),
+        "--shared-green-seconds", str(shared_green_seconds),
         "--results-dir", results_dir,
         "--experiment-id", exp_id,
         "--run-id", run_id,
@@ -61,6 +67,28 @@ def run_one(py_cmd, mode, seed, spawn_rate, duration, dt, results_dir, exp_id,
             cmd.extend(["--rl-epsilon-min", str(rl_epsilon_min)])
         if rl_epsilon_decay is not None:
             cmd.extend(["--rl-epsilon-decay", str(rl_epsilon_decay)])
+        if rl_starvation_t is not None:
+            cmd.extend(["--rl-starvation-t", str(rl_starvation_t)])
+        if rl_w_queue_delta is not None:
+            cmd.extend(["--rl-w-queue-delta", str(rl_w_queue_delta)])
+        if rl_w_wait_delta is not None:
+            cmd.extend(["--rl-w-wait-delta", str(rl_w_wait_delta)])
+        if rl_w_maxwait_delta is not None:
+            cmd.extend(["--rl-w-maxwait-delta", str(rl_w_maxwait_delta)])
+        if rl_w_throughput is not None:
+            cmd.extend(["--rl-w-throughput", str(rl_w_throughput)])
+        if rl_w_cur_queue is not None:
+            cmd.extend(["--rl-w-cur-queue", str(rl_w_cur_queue)])
+        if rl_w_cur_wait_mass is not None:
+            cmd.extend(["--rl-w-cur-wait-mass", str(rl_w_cur_wait_mass)])
+        if rl_w_cur_maxwait is not None:
+            cmd.extend(["--rl-w-cur-maxwait", str(rl_w_cur_maxwait)])
+        if rl_w_imbalance is not None:
+            cmd.extend(["--rl-w-imbalance", str(rl_w_imbalance)])
+        if rl_w_starved is not None:
+            cmd.extend(["--rl-w-starved", str(rl_w_starved)])
+        if rl_switch_penalty is not None:
+            cmd.extend(["--rl-switch-penalty", str(rl_switch_penalty)])
     if mode == "neural":
         cmd.extend(["--neural-model-path", neural_model_path])
     if no_log:
@@ -239,6 +267,8 @@ def main():
     parser.add_argument("--spawn-rates", default="1.0,2.0")
     parser.add_argument("--duration", type=int, default=120)
     parser.add_argument("--dt", type=float, default=1.0 / 60.0)
+    parser.add_argument("--fixed-green-seconds", type=int, default=9)
+    parser.add_argument("--shared-green-seconds", type=int, default=3)
     parser.add_argument("--results-dir", default="results")
     parser.add_argument("--experiment-id", default="")
     parser.add_argument("--python", default=sys.executable)
@@ -254,6 +284,17 @@ def main():
     parser.add_argument("--rl-epsilon", type=float, default=None)
     parser.add_argument("--rl-epsilon-min", type=float, default=None)
     parser.add_argument("--rl-epsilon-decay", type=float, default=None)
+    parser.add_argument("--rl-starvation-t", type=float, default=None)
+    parser.add_argument("--rl-w-queue-delta", type=float, default=None)
+    parser.add_argument("--rl-w-wait-delta", type=float, default=None)
+    parser.add_argument("--rl-w-maxwait-delta", type=float, default=None)
+    parser.add_argument("--rl-w-throughput", type=float, default=None)
+    parser.add_argument("--rl-w-cur-queue", type=float, default=None)
+    parser.add_argument("--rl-w-cur-wait-mass", type=float, default=None)
+    parser.add_argument("--rl-w-cur-maxwait", type=float, default=None)
+    parser.add_argument("--rl-w-imbalance", type=float, default=None)
+    parser.add_argument("--rl-w-starved", type=float, default=None)
+    parser.add_argument("--rl-switch-penalty", type=float, default=None)
     parser.add_argument("--neural-model-path", default="models/neural_hybrid.pt")
     parser.add_argument(
         "--select-best-rl-from",
@@ -335,6 +376,19 @@ def main():
             args.rl_epsilon,
             args.rl_epsilon_min,
             args.rl_epsilon_decay,
+            args.rl_starvation_t,
+            args.rl_w_queue_delta,
+            args.rl_w_wait_delta,
+            args.rl_w_maxwait_delta,
+            args.rl_w_throughput,
+            args.rl_w_cur_queue,
+            args.rl_w_cur_wait_mass,
+            args.rl_w_cur_maxwait,
+            args.rl_w_imbalance,
+            args.rl_w_starved,
+            args.rl_switch_penalty,
+            args.fixed_green_seconds,
+            args.shared_green_seconds,
             args.neural_model_path,
         )
         all_rows.extend(flatten_summary(exp_id, run_id, summary))
