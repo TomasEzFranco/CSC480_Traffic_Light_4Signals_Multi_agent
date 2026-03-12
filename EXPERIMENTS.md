@@ -1,317 +1,232 @@
-# Traffic Simulation Experiment Runbook
+# Traffic Simulation Experiments (RL + Neural)
 
-This document covers:
-- Running single simulations
-- Running batch experiments
-- Training RL agents and saving weights
-- Evaluating RL models
-- Auto-selecting the best RL model
-- Comparing best RL vs baseline controllers
-- Generating plots
+This runbook documents the current reproducible protocol for RL and Neural models.
 
-## 1. Go To Project Folder
+## 1. Fixed Seed Split (Use This Everywhere)
+
+- Train seeds: `40,41,42,43,44,45,46,47`
+- Validation seeds: `48,49,50`
+- Test seeds: `51,52,53`
+
+Keep train/val/test disjoint for both RL and neural.
+
+## 2. Go To Project Folder
 
 ```bash
-cd /Users/quasar/Documents/CSC480/TrafficLightFinalProject/CSC480traffic_project_updated_RL_4_Intersections
+cd /Users/quasar/Documents/CSC480/TrafficLightFinalProject/CSC480traffic_project_hybrid_fresh
 ```
 
-## 2. Single Run (Quick Check)
-
-Headless run with one controller:
+## 3. Install Dependencies
 
 ```bash
-python3 simulation.py \
-  --headless \
-  --mode adaptive \
-  --seed 42 \
-  --spawn-rate 1.0 \
-  --duration 120 \
+python3 -m pip install -r requirements.txt
+```
+
+## 4. Why Tune Hyperparameters First (Short Justification)
+
+We tune RL hyperparameters first because tabular Q-learning is sensitive to reward scaling and switch penalties.
+
+- Better reward balance can reduce avg wait without collapsing throughput.
+- A short sweep is much cheaper than running a full 40-epoch study repeatedly.
+- It makes the final long run defensible: we pre-select one config on validation only, then lock it.
+
+## 5. RL Parameter Study (Short Sweep)
+
+Run a short sweep first:
+
+```bash
+python3 rl_reward_parametric_study.py \
+  --study-id rl_param_sweep_40_53_v1 \
+  --epochs 6 \
+  --train-seeds 40,41,42,43,44,45,46,47 \
+  --val-seeds 48,49,50 \
+  --test-seeds 51,52,53 \
+  --spawn-rates 1.0 \
+  --duration-train 180 \
+  --duration-eval 90 \
   --dt 0.0166667 \
-  --experiment-id quick_check \
-  --run-id adaptive_seed42_spawn1p00
-```
-
-Outputs:
-- `results/quick_check/adaptive_seed42_spawn1p00/config.json`
-- `results/quick_check/adaptive_seed42_spawn1p00/summary.json`
-- `results/quick_check/adaptive_seed42_spawn1p00/intersection_timeseries.csv`
-
-## 3. Batch Baseline Experiments
-
-Run fixed/greedy/adaptive/random over multiple seeds/spawn rates:
-
-```bash
-python3 run_experiments.py \
-  --modes fixed,greedy,adaptive,random \
-  --seeds 42,43,44 \
-  --spawn-rates 1.0,2.0 \
-  --duration 180 \
-  --dt 0.0166667 \
-  --experiment-id baseline_v1
-```
-
-Output summary table:
-- `results/baseline_v1/summary.csv`
-
-## 4. Train RL Models
-
-Train RL and save one model per run using a templated path:
-
-```bash
-python3 run_experiments.py \
-  --modes rl \
-  --seeds 42,43,44 \
-  --spawn-rates 1.0,2.0 \
-  --duration 180 \
-  --dt 0.0166667 \
-  --experiment-id rl_train_v2 \
-  --rl-train \
-  --rl-model-path "models/rl_{seed}_{run_id}.json"
-```
-
-Notes:
-- `--rl-train` enables Q-learning updates.
-- RL weights are saved at the end of each run.
-
-## 5. Evaluate RL Models (No Training)
-
-Use the same model-path template so each eval run loads its corresponding trained model:
-
-```bash
-python3 run_experiments.py \
-  --modes rl \
-  --seeds 42,43,44 \
-  --spawn-rates 1.0,2.0 \
-  --duration 180 \
-  --dt 0.0166667 \
-  --experiment-id rl_eval_v2 \
-  --rl-model-path "models/rl_{seed}_{run_id}.json"
-```
-
-The RL model path used by each run is written into `summary.csv` as `rl_model_path`.
-
-## 6. Auto-Select Best RL + Compare vs Baselines
-
-One command can now:
-1. Select the best RL model from a prior eval experiment (`rl_eval_v2`),
-2. Copy it to `models/rl_best.json`,
-3. Run the full baseline + RL comparison.
-
-```bash
-python3 run_experiments.py \
-  --modes fixed,greedy,adaptive,random,rl \
-  --seeds 42,43,44 \
-  --spawn-rates 1.0,2.0 \
-  --duration 180 \
-  --dt 0.0166667 \
-  --experiment-id compare_best_rl_v2 \
-  --select-best-rl-from rl_eval_v2 \
-  --select-best-rl-output models/rl_best.json
-```
-
-Additional artifact:
-- `results/compare_best_rl_v2/best_rl_selection.json`
-
-Best-model criterion used by the script:
-- only rows where `iid = -1` and `mode = rl`
-- lowest `avg_wait`
-- tie-breakers: lower `red_light_violations`, then higher `throughput`
-
-## 7. Generate Graphs
-
-```bash
-python3 visualize_results.py --experiment-id compare_best_rl_v2
-```
-
-Generated plots:
-- `results/compare_best_rl_v2/mode_comparison.png`
-- `results/compare_best_rl_v2/seed_boxplots.png`
-- `results/compare_best_rl_v2/queue_timeseries.png` (if timeseries data available)
-
-## 8. Confirm Selected Best Model
-
-```bash
-cat results/compare_best_rl_v2/best_rl_selection.json
-```
-
-## 9. Recommended End-to-End Command Sequence
-
-```bash
-cd /Users/quasar/Documents/CSC480/TrafficLightFinalProject/CSC480traffic_project_updated_RL_4_Intersections
-
-python3 run_experiments.py \
-  --modes rl \
-  --seeds 42,43,44 \
-  --spawn-rates 1.0,2.0 \
-  --duration 180 \
-  --dt 0.0166667 \
-  --experiment-id rl_train_v2 \
-  --rl-train \
-  --rl-model-path "models/rl_{seed}_{run_id}.json"
-
-python3 run_experiments.py \
-  --modes rl \
-  --seeds 42,43,44 \
-  --spawn-rates 1.0,2.0 \
-  --duration 180 \
-  --dt 0.0166667 \
-  --experiment-id rl_eval_v2 \
-  --rl-model-path "models/rl_{seed}_{run_id}.json"
-
-python3 run_experiments.py \
-  --modes fixed,greedy,adaptive,random,rl \
-  --seeds 42,43,44 \
-  --spawn-rates 1.0,2.0 \
-  --duration 180 \
-  --dt 0.0166667 \
-  --experiment-id compare_best_rl_v2 \
-  --select-best-rl-from rl_eval_v2 \
-  --select-best-rl-output models/rl_best.json
-
-python3 visualize_results.py --experiment-id compare_best_rl_v2
-```
-
-## 10. Important Output Files Per Experiment
-
-Inside `results/<experiment-id>/`:
-- `summary.csv`: flattened metrics across runs and intersections (`iid = -1` is overall row)
-- `<run-id>/config.json`: run configuration
-- `<run-id>/summary.json`: nested summary for that run
-- `<run-id>/intersection_timeseries.csv`: time-series metrics
-
-## 11. Reproducibility Tips
-
-- Keep `--dt`, `--duration`, `--seeds`, and `--spawn-rates` fixed across comparisons.
-- Use a new `--experiment-id` for each study to avoid mixing outputs.
-- Use `--no-log` during quick smoke tests if you do not need timeseries CSVs.
-
-## 12. Train RL Longer (Recommended)
-
-Because RL updates happen at phase-switch decisions, longer runs and repeated epochs improve learning.
-
-```bash
-cd /Users/quasar/Documents/CSC480/TrafficLightFinalProject/CSC480traffic_project_updated_RL_4_Intersections
-
-for epoch in $(seq 1 20); do
-  python3 run_experiments.py \
-    --modes rl \
-    --seeds 42,43,44 \
-    --spawn-rates 1.0,2.0 \
-    --duration 600 \
-    --dt 0.0166667 \
-    --experiment-id rl_train_v3_e${epoch} \
-    --rl-train \
-    --rl-model-path "models/rl_{seed}_{run_id}.json"
-done
-```
-
-Then evaluate and compare:
-
-```bash
-python3 run_experiments.py \
-  --modes rl \
-  --seeds 42,43,44 \
-  --spawn-rates 1.0,2.0 \
-  --duration 180 \
-  --dt 0.0166667 \
-  --experiment-id rl_eval_v3 \
-  --rl-model-path "models/rl_{seed}_{run_id}.json"
-
-python3 run_experiments.py \
-  --modes fixed,greedy,adaptive,random,rl \
-  --seeds 42,43,44 \
-  --spawn-rates 1.0,2.0 \
-  --duration 180 \
-  --dt 0.0166667 \
-  --experiment-id compare_best_rl_v3 \
-  --select-best-rl-from rl_eval_v3 \
-  --select-best-rl-output models/rl_best.json
-
-python3 visualize_results.py --experiment-id compare_best_rl_v3
-```
-
-## 13. RL Hyperparameter Sweep (Optional)
-
-```bash
-for alpha in 0.10 0.20 0.30; do
-  python3 simulation.py \
-    --headless \
-    --mode rl \
-    --seed 42 \
-    --spawn-rate 1.0 \
-    --duration 900 \
-    --dt 0.0166667 \
-    --experiment-id rl_hp_sweep \
-    --run-id rl_a${alpha}_seed42_spawn1p00 \
-    --rl-train \
-    --rl-model-path "models/rl_a${alpha}_seed42_spawn1p00.json" \
-    --rl-alpha ${alpha} \
-    --rl-gamma 0.95 \
-    --rl-epsilon 0.30 \
-    --rl-epsilon-min 0.02 \
-    --rl-epsilon-decay 0.9997
-done
-```
-
-You can also pass RL hyperparameters through batch training now:
-
-```bash
-python3 run_experiments.py \
-  --modes rl \
-  --seeds 42,43,44 \
-  --spawn-rates 1.0,2.0 \
-  --duration 600 \
-  --dt 0.0166667 \
-  --experiment-id rl_train_hp_v1 \
-  --rl-train \
-  --rl-model-path "models/rlhp_{seed}_{run_id}.json" \
-  --rl-alpha 0.15 \
-  --rl-gamma 0.97 \
-  --rl-epsilon 0.30 \
+  --rl-alpha 0.20 \
+  --rl-gamma 0.95 \
+  --rl-epsilon 0.20 \
   --rl-epsilon-min 0.02 \
-  --rl-epsilon-decay 0.9997
+  --rl-epsilon-decay 0.9995 \
+  --no-log
 ```
 
-## 14. Epoch Study + RL-Only Comparison Graphs
+Extract these artifacts:
 
-`rl_epoch_study.py` automates:
-1. train for `N` epochs,
-2. snapshot models each epoch,
-3. eval each epoch,
-4. plot epoch metrics and per-model trend lines,
-5. auto-pick the best model.
+- `results/rl_param_sweep_40_53_v1/combined_epoch_metrics.csv`: every epoch for every config.
+- `results/rl_param_sweep_40_53_v1/best_config_by_validation.csv`: best epoch per config using validation metrics.
+- `results/rl_param_sweep_40_53_v1/reward_sweep_epoch_dashboard.png`: learning curves.
+- `results/rl_param_sweep_40_53_v1/reward_sweep_best_tradeoff.png`: wait/throughput frontier.
+
+What to pick from the sweep:
+
+- Choose one final reward config using validation-only metrics:
+- Lowest `avg_wait_mean`
+- Tie-breaker: lowest `red_light_violations_mean`
+- Tie-breaker: highest `throughput_mean`
+- Copy the selected values for `--rl-w-throughput`, `--rl-switch-penalty`, and `--rl-w-queue-delta`.
+
+## 6. RL Full Epoch Study (Long Run for Best RL Model)
+
+This long run does all RL stages:
+1. trains one shared Q-table on train seeds each epoch,
+2. validates snapshots on val seeds each epoch,
+3. selects best epoch by validation means only,
+4. copies best model,
+5. runs holdout compare on test seeds.
 
 ```bash
 python3 rl_epoch_study.py \
-  --study-id rl_epoch_study_v4 \
-  --epochs 20 \
-  --seeds 42,43,44 \
-  --spawn-rates 1.0,2.0 \
-  --duration-train 600 \
+  --study-id rl_split_40_53_v1 \
+  --epochs 40 \
+  --train-seeds 40,41,42,43,44,45,46,47 \
+  --val-seeds 48,49,50 \
+  --test-seeds 51,52,53 \
+  --spawn-rates 1.0 \
+  --duration-train 900 \
   --duration-eval 180 \
+  --compare-duration 180 \
   --dt 0.0166667 \
-  --rl-alpha 0.15 \
-  --rl-gamma 0.97 \
-  --rl-epsilon 0.30 \
-  --rl-epsilon-min 0.02 \
-  --rl-epsilon-decay 0.9997
+  --rl-w-throughput 1.25 \
+  --rl-switch-penalty 0.10 \
+  --rl-w-queue-delta 1.30 \
+  --model-path models/studies/rl_split_40_53_v1/shared_qtable.json \
+  --best-model-output models/rl_best_split_40_53_v1.json \
+  --run-compare
 ```
 
-Outputs:
-- `results/rl_epoch_study_v4/epoch_summary.csv`
-- `results/rl_epoch_study_v4/all_eval_rows.csv`
-- `results/rl_epoch_study_v4/rl_epoch_metrics.png`
-- `results/rl_epoch_study_v4/rl_epoch_run_comparison.png`
-- `results/rl_epoch_study_v4/best_rl_selection.json`
-- `models/rl_best_from_epoch_study.json`
+Key outputs:
+- `results/rl_split_40_53_v1/epoch_summary.csv`
+- `results/rl_split_40_53_v1/all_val_rows.csv`
+- `results/rl_split_40_53_v1/rl_epoch_metrics.png`
+- `results/rl_split_40_53_v1/rl_epoch_run_comparison.png`
+- `results/rl_split_40_53_v1/best_rl_selection.json`
+- `models/rl_best_split_40_53_v1.json`
+- `results/rl_split_40_53_v1_compare_best/summary.csv`
 
-## 15. RL Training Details (Current Implementation)
+## 7. RL Holdout Compare Graphs
 
-- Controller scope: one RL controller per intersection (`iid` 0..3), sharing one global Q-table.
-- State per decision: `(current_phase, bin(q_right), bin(q_down), bin(q_left), bin(q_up))`.
-- Queue binning: each direction bucketed by `q // 3`, capped at 8.
-- Action: next phase index in `{0,1,2,3}`.
-- Decision timing: RL updates on phase-switch decisions, not per frame.
-- Reward: `(previous_total_queue - current_total_queue) - 0.05 * current_total_queue`.
-- Policy: epsilon-greedy during training; greedy/tie-random at eval.
-- Saved model: JSON Q-table + epsilon + metadata at `--rl-model-path`.
+```bash
+python3 visualize_results.py --experiment-id rl_split_40_53_v1_compare_best
+```
+
+Generated:
+- `results/rl_split_40_53_v1_compare_best/mode_comparison.png`
+- `results/rl_split_40_53_v1_compare_best/seed_boxplots.png`
+- `results/rl_split_40_53_v1_compare_best/queue_timeseries.png`
+
+## 8. Neural Data Collection (Train + Val Splits)
+
+Collect supervised data from teacher policy separately for train and validation seeds.
+
+Train dataset:
+```bash
+python3 collect_neural_data.py \
+  --seeds 40,41,42,43,44,45,46,47 \
+  --spawn-rates 1.0 \
+  --duration 300 \
+  --dt 0.0166667 \
+  --teacher-policy hybrid \
+  --data-path data/neural/hybrid_train_40_47.csv
+```
+
+Validation dataset:
+```bash
+python3 collect_neural_data.py \
+  --seeds 48,49,50 \
+  --spawn-rates 1.0 \
+  --duration 300 \
+  --dt 0.0166667 \
+  --teacher-policy hybrid \
+  --data-path data/neural/hybrid_val_48_50.csv
+```
+
+## 9. Neural Training
+
+```bash
+python3 train_neural_policy.py \
+  --train-csv data/neural/hybrid_train_40_47.csv \
+  --val-csv data/neural/hybrid_val_48_50.csv \
+  --save-path models/neural_split_40_53_v1.pt \
+  --epochs 80 \
+  --batch-size 256 \
+  --lr 0.001 \
+  --weight-decay 0.0001 \
+  --patience 12 \
+  --seed 123
+```
+
+`train_neural_policy.py` selects the checkpoint with best validation accuracy internally.
+
+## 10. Neural Holdout Test (Test Seeds Only)
+
+```bash
+python3 run_experiments.py \
+  --modes neural \
+  --seeds 51,52,53 \
+  --spawn-rates 1.0 \
+  --duration 180 \
+  --dt 0.0166667 \
+  --experiment-id neural_test_40_53_v1 \
+  --neural-model-path models/neural_split_40_53_v1.pt
+```
+
+Output:
+- `results/neural_test_40_53_v1/summary.csv`
+
+## 11. Final Holdout Comparison (All Modes, Same Test Seeds)
+
+Use selected RL + trained neural on identical unseen test seeds:
+
+```bash
+python3 run_experiments.py \
+  --modes fixed,greedy,adaptive,random,rl,neural \
+  --seeds 51,52,53 \
+  --spawn-rates 1.0 \
+  --duration 180 \
+  --dt 0.0166667 \
+  --experiment-id compare_all_test_40_53_v1 \
+  --rl-model-path models/rl_best_split_40_53_v1.json \
+  --neural-model-path models/neural_split_40_53_v1.pt
+```
+
+Then plot:
+```bash
+python3 visualize_results.py --experiment-id compare_all_test_40_53_v1
+```
+
+## 12. Quick GUI Run (Visual Check)
+
+Greedy GUI:
+```bash
+python3 simulation.py \
+  --mode greedy \
+  --seed 51 \
+  --spawn-rate 1.0 \
+  --duration 90 \
+  --dt 0.0166667 \
+  --fixed-green-seconds 9 \
+  --shared-green-seconds 3
+```
+
+RL GUI (best split model):
+```bash
+python3 simulation.py \
+  --mode rl \
+  --seed 51 \
+  --spawn-rate 1.0 \
+  --duration 90 \
+  --dt 0.0166667 \
+  --fixed-green-seconds 9 \
+  --shared-green-seconds 3 \
+  --rl-model-path models/rl_best_split_40_53_v1.json
+```
+
+## 13. Reproducibility Notes
+
+- Keep `--dt`, `--duration`, `--spawn-rates`, and seed splits fixed between model comparisons.
+- Do not use test seeds (`51,52,53`) for model selection or hyperparameter tuning.
+- Use a fresh `--experiment-id` per run.
+- Use `--no-log` for faster sweeps if time-series CSV is not needed.
