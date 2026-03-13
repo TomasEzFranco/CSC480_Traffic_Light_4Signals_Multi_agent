@@ -31,7 +31,7 @@ parser.add_argument("--log",        default="metrics.csv")
 parser.add_argument("--no-log",     action="store_true")
 parser.add_argument("--legacy-log", action="store_true")
 parser.add_argument("--dt",         type=float, default=1.0 / 60.0)
-parser.add_argument("--fixed-green-seconds", type=int, default=9)
+parser.add_argument("--fixed-green-seconds", type=int, default=3)
 parser.add_argument("--shared-green-seconds", type=int, default=3)
 parser.add_argument("--results-dir", default="results")
 parser.add_argument("--experiment-id", default="")
@@ -44,16 +44,32 @@ parser.add_argument("--rl-epsilon", type=float, default=0.20)
 parser.add_argument("--rl-epsilon-min", type=float, default=0.02)
 parser.add_argument("--rl-epsilon-decay", type=float, default=0.9995)
 parser.add_argument("--rl-starvation-t", type=float, default=None)
-parser.add_argument("--rl-w-queue-delta", type=float, default=None)
-parser.add_argument("--rl-w-wait-delta", type=float, default=None)
-parser.add_argument("--rl-w-maxwait-delta", type=float, default=None)
-parser.add_argument("--rl-w-throughput", type=float, default=None)
-parser.add_argument("--rl-w-cur-queue", type=float, default=None)
-parser.add_argument("--rl-w-cur-wait-mass", type=float, default=None)
-parser.add_argument("--rl-w-cur-maxwait", type=float, default=None)
-parser.add_argument("--rl-w-imbalance", type=float, default=None)
-parser.add_argument("--rl-w-starved", type=float, default=None)
-parser.add_argument("--rl-switch-penalty", type=float, default=None)
+parser.add_argument(
+    "--rl-w-throughput",
+    type=float,
+    default=None,
+    help="Reward weight for increasing cars crossed between decisions.",
+)
+parser.add_argument(
+    "--rl-w-wait-delta",
+    type=float,
+    default=None,
+    help="Reward weight for reducing queue-weighted wait mass between decisions.",
+)
+parser.add_argument(
+    "--rl-switch-penalty",
+    type=float,
+    default=None,
+    help="Penalty applied when RL switches to a different phase.",
+)
+# Legacy reward knobs retained only for backward CLI compatibility.
+parser.add_argument("--rl-w-maxwait-delta", type=float, default=None, help=argparse.SUPPRESS)
+parser.add_argument("--rl-w-queue-delta", type=float, default=None, help=argparse.SUPPRESS)
+parser.add_argument("--rl-w-cur-queue", type=float, default=None, help=argparse.SUPPRESS)
+parser.add_argument("--rl-w-cur-wait-mass", type=float, default=None, help=argparse.SUPPRESS)
+parser.add_argument("--rl-w-cur-maxwait", type=float, default=None, help=argparse.SUPPRESS)
+parser.add_argument("--rl-w-imbalance", type=float, default=None, help=argparse.SUPPRESS)
+parser.add_argument("--rl-w-starved", type=float, default=None, help=argparse.SUPPRESS)
 parser.add_argument("--neural-model-path", default="models/neural_hybrid.pt")
 parser.add_argument("--collect-neural-data", action="store_true")
 parser.add_argument("--neural-data-path", default="data/neural/greedy_data.csv")
@@ -129,21 +145,15 @@ class Config:
     RL_EPSILON_MIN   = args.rl_epsilon_min
     RL_EPSILON_DECAY = args.rl_epsilon_decay
     RL_STARVATION_T  = args.rl_starvation_t if args.rl_starvation_t is not None else 35.0
-    RL_W_QUEUE_DELTA = args.rl_w_queue_delta if args.rl_w_queue_delta is not None else 1.30
-    RL_W_WAIT_DELTA = args.rl_w_wait_delta if args.rl_w_wait_delta is not None else 0.030
-    RL_W_MAXWAIT_DELTA = (
-        args.rl_w_maxwait_delta if args.rl_w_maxwait_delta is not None else 0.22
+    # Simplified RL reward: throughput increase + wait reduction - switch penalty.
+    RL_W_THROUGHPUT = (
+        args.rl_w_throughput
+        if args.rl_w_throughput is not None
+        else (args.rl_w_queue_delta if args.rl_w_queue_delta is not None else 1.00)
     )
-    RL_W_THROUGHPUT = args.rl_w_throughput if args.rl_w_throughput is not None else 1.10
-    RL_W_CUR_QUEUE = args.rl_w_cur_queue if args.rl_w_cur_queue is not None else 0.08
-    RL_W_CUR_WAIT_MASS = (
-        args.rl_w_cur_wait_mass if args.rl_w_cur_wait_mass is not None else 0.0015
-    )
-    RL_W_CUR_MAXWAIT = args.rl_w_cur_maxwait if args.rl_w_cur_maxwait is not None else 0.020
-    RL_W_IMBALANCE = args.rl_w_imbalance if args.rl_w_imbalance is not None else 0.08
-    RL_W_STARVED = args.rl_w_starved if args.rl_w_starved is not None else 0.35
+    RL_W_WAIT_DELTA = args.rl_w_wait_delta if args.rl_w_wait_delta is not None else 0.050
     RL_SWITCH_PENALTY = (
-        args.rl_switch_penalty if args.rl_switch_penalty is not None else 0.15
+        args.rl_switch_penalty if args.rl_switch_penalty is not None else 0.20
     )
     NEURAL_MODEL_PATH = args.neural_model_path
     COLLECT_NEURAL_DATA = args.collect_neural_data
@@ -277,15 +287,10 @@ class RunArtifacts:
                 "rl_epsilon_min": C.RL_EPSILON_MIN,
                 "rl_epsilon_decay": C.RL_EPSILON_DECAY,
                 "rl_starvation_t": C.RL_STARVATION_T,
-                "rl_w_queue_delta": C.RL_W_QUEUE_DELTA,
-                "rl_w_wait_delta": C.RL_W_WAIT_DELTA,
-                "rl_w_maxwait_delta": C.RL_W_MAXWAIT_DELTA,
+                "rl_reward_mode": "throughput_wait_switch",
                 "rl_w_throughput": C.RL_W_THROUGHPUT,
-                "rl_w_cur_queue": C.RL_W_CUR_QUEUE,
-                "rl_w_cur_wait_mass": C.RL_W_CUR_WAIT_MASS,
-                "rl_w_cur_maxwait": C.RL_W_CUR_MAXWAIT,
-                "rl_w_imbalance": C.RL_W_IMBALANCE,
-                "rl_w_starved": C.RL_W_STARVED,
+                "rl_w_queue_delta": C.RL_W_THROUGHPUT,
+                "rl_w_wait_delta": C.RL_W_WAIT_DELTA,
                 "rl_switch_penalty": C.RL_SWITCH_PENALTY,
                 "neural_model_path": C.NEURAL_MODEL_PATH,
                 "collect_neural_data": C.COLLECT_NEURAL_DATA,
@@ -857,8 +862,8 @@ class RLController(SignalController):
     Improvements over the original version:
       - richer tabular state with queue, wait, pressure, and starvation summary
       - heuristic-prior Q initialisation for unseen states
-      - shaped reward based on queue reduction, wait reduction, throughput,
-        imbalance, starvation, and switch cost
+      - simplified shaped reward based on throughput increase, wait reduction,
+        and switch cost
       - explicit option to keep the current phase by selecting the same phase
         again when green expires (handled in SimState._step_signals_one_second)
     """
@@ -969,21 +974,9 @@ class RLController(SignalController):
         return vals
 
     def _reward(self, prev_m, cur_m):
-        delta_q = prev_m["total_q"] - cur_m["total_q"]
+        delta_throughput = cur_m["crossed"] - prev_m["crossed"]
         delta_wait = prev_m["wait_mass"] - cur_m["wait_mass"]
-        delta_max_wait = prev_m["max_wait"] - cur_m["max_wait"]
-        delta_cross = cur_m["crossed"] - prev_m["crossed"]
-        reward = (
-            C.RL_W_QUEUE_DELTA * delta_q
-            + C.RL_W_WAIT_DELTA * delta_wait
-            + C.RL_W_MAXWAIT_DELTA * delta_max_wait
-            + C.RL_W_THROUGHPUT * delta_cross
-            - C.RL_W_CUR_QUEUE * cur_m["total_q"]
-            - C.RL_W_CUR_WAIT_MASS * cur_m["wait_mass"]
-            - C.RL_W_CUR_MAXWAIT * cur_m["max_wait"]
-            - C.RL_W_IMBALANCE * cur_m["imbalance"]
-            - C.RL_W_STARVED * cur_m["starved_count"]
-        )
+        reward = C.RL_W_THROUGHPUT * delta_throughput + C.RL_W_WAIT_DELTA * delta_wait
         if self.prev_switched:
             reward -= C.RL_SWITCH_PENALTY
         return reward

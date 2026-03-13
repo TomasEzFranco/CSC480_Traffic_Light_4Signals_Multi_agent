@@ -58,21 +58,64 @@ def pick_best_row(rows):
     )[0]
 
 
-def summarize_epoch(eval_summary_csv, epoch_idx):
-    rows = read_rows(eval_summary_csv)
+def _mean(xs):
+    return statistics.mean(xs) if xs else 0.0
+
+
+def _stdev(xs):
+    return statistics.stdev(xs) if len(xs) > 1 else 0.0
+
+
+def _metric_stats(rows, key):
+    vals = [as_float(r, key) for r in rows]
+    if not vals:
+        return {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+        }
+    return {
+        "mean": _mean(vals),
+        "std": _stdev(vals),
+        "min": min(vals),
+        "max": max(vals),
+    }
+
+
+def summarize_split(summary_csv, epoch_idx, split_name):
+    rows = read_rows(summary_csv)
     rl_rows = [r for r in rows if int(float(r["iid"])) == -1 and r["mode"] == "rl"]
     if not rl_rows:
-        raise RuntimeError(f"no RL overall rows in {eval_summary_csv}")
+        raise RuntimeError(f"no RL overall rows in {summary_csv}")
 
     best = pick_best_row(rl_rows)
+    avg_wait_stats = _metric_stats(rl_rows, "avg_wait")
+    throughput_stats = _metric_stats(rl_rows, "throughput")
+    fairness_stats = _metric_stats(rl_rows, "fairness")
+    red_stats = _metric_stats(rl_rows, "red_light_violations")
+
     return {
         "epoch": epoch_idx,
-        "eval_summary_csv": str(eval_summary_csv),
+        "split": split_name,
+        "summary_csv": str(summary_csv),
         "n_runs": len(rl_rows),
-        "avg_wait_mean": statistics.mean(as_float(r, "avg_wait") for r in rl_rows),
-        "throughput_mean": statistics.mean(as_float(r, "throughput") for r in rl_rows),
-        "fairness_mean": statistics.mean(as_float(r, "fairness") for r in rl_rows),
-        "red_light_violations_mean": statistics.mean(as_float(r, "red_light_violations") for r in rl_rows),
+        "avg_wait_mean": avg_wait_stats["mean"],
+        "avg_wait_std": avg_wait_stats["std"],
+        "avg_wait_min": avg_wait_stats["min"],
+        "avg_wait_max": avg_wait_stats["max"],
+        "throughput_mean": throughput_stats["mean"],
+        "throughput_std": throughput_stats["std"],
+        "throughput_min": throughput_stats["min"],
+        "throughput_max": throughput_stats["max"],
+        "fairness_mean": fairness_stats["mean"],
+        "fairness_std": fairness_stats["std"],
+        "fairness_min": fairness_stats["min"],
+        "fairness_max": fairness_stats["max"],
+        "red_light_violations_mean": red_stats["mean"],
+        "red_light_violations_std": red_stats["std"],
+        "red_light_violations_min": red_stats["min"],
+        "red_light_violations_max": red_stats["max"],
         "best_run_id": best["run_id"],
         "best_model_path": best["rl_model_path"],
         "best_avg_wait": as_float(best, "avg_wait"),
@@ -85,8 +128,11 @@ def summarize_epoch(eval_summary_csv, epoch_idx):
 
 def write_epoch_csv(path, epoch_rows):
     fields = [
-        "epoch", "eval_summary_csv", "n_runs",
+        "epoch", "split", "summary_csv", "n_runs",
         "avg_wait_mean", "throughput_mean", "fairness_mean", "red_light_violations_mean",
+        "avg_wait_std", "throughput_std", "fairness_std", "red_light_violations_std",
+        "avg_wait_min", "throughput_min", "fairness_min", "red_light_violations_min",
+        "avg_wait_max", "throughput_max", "fairness_max", "red_light_violations_max",
         "best_run_id", "best_model_path",
         "best_avg_wait", "best_throughput", "best_fairness", "best_red_light_violations",
     ]
@@ -97,8 +143,8 @@ def write_epoch_csv(path, epoch_rows):
             w.writerow({k: r[k] for k in fields})
 
 
-def plot_epoch_means(epoch_rows, out_path):
-    epochs = [r["epoch"] for r in epoch_rows]
+def plot_epoch_means(val_rows, out_path):
+    epochs = [r["epoch"] for r in val_rows]
     fig, axes = plt.subplots(2, 2, figsize=(11.5, 7.5))
     metrics = [
         ("avg_wait_mean", "Avg wait (lower better)"),
@@ -107,7 +153,7 @@ def plot_epoch_means(epoch_rows, out_path):
         ("red_light_violations_mean", "Red violations (lower better)"),
     ]
     for ax, (key, title) in zip(axes.flatten(), metrics):
-        vals = [float(r[key]) for r in epoch_rows]
+        vals = [float(r[key]) for r in val_rows]
         ax.plot(epochs, vals, marker="o")
         ax.set_title(title)
         ax.set_xlabel("Epoch")
@@ -143,6 +189,127 @@ def plot_run_lines(epoch_rows, out_path):
     print(f"[plot] {out_path}")
 
 
+def plot_train_val_dashboard(train_rows, val_rows, out_path):
+    epochs = [r["epoch"] for r in val_rows]
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    panels = [
+        ("avg_wait", "Avg wait (lower better)"),
+        ("throughput", "Throughput (higher better)"),
+        ("fairness", "Fairness (higher better)"),
+        ("red_light_violations", "Red violations (lower better)"),
+    ]
+    for ax, (metric, title) in zip(axes.flatten(), panels):
+        tr_mean = [float(r[f"{metric}_mean"]) for r in train_rows]
+        tr_std = [float(r[f"{metric}_std"]) for r in train_rows]
+        va_mean = [float(r[f"{metric}_mean"]) for r in val_rows]
+        va_std = [float(r[f"{metric}_std"]) for r in val_rows]
+
+        ax.plot(epochs, tr_mean, label="train", color="#1f77b4", marker="o")
+        ax.fill_between(
+            epochs,
+            [m - s for m, s in zip(tr_mean, tr_std)],
+            [m + s for m, s in zip(tr_mean, tr_std)],
+            color="#1f77b4",
+            alpha=0.15,
+        )
+        ax.plot(epochs, va_mean, label="validation", color="#d62728", marker="s")
+        ax.fill_between(
+            epochs,
+            [m - s for m, s in zip(va_mean, va_std)],
+            [m + s for m, s in zip(va_mean, va_std)],
+            color="#d62728",
+            alpha=0.15,
+        )
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        ax.grid(alpha=0.25)
+
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=2, frameon=True)
+    fig.suptitle("RL Epoch Study: Train vs Validation (mean +/- std)", y=0.99)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(out_path, dpi=180)
+    plt.close(fig)
+    print(f"[plot] {out_path}")
+
+
+def plot_improvement_curves(val_rows, out_path):
+    if not val_rows:
+        return
+    epochs = [r["epoch"] for r in val_rows]
+    base_wait = float(val_rows[0]["avg_wait_mean"])
+    base_thr = float(val_rows[0]["throughput_mean"])
+    base_fair = float(val_rows[0]["fairness_mean"])
+    base_red = float(val_rows[0]["red_light_violations_mean"])
+
+    def pct_improve_low(cur, base):
+        if abs(base) < 1e-12:
+            return 0.0
+        return 100.0 * (base - cur) / abs(base)
+
+    def pct_improve_high(cur, base):
+        if abs(base) < 1e-12:
+            return 0.0
+        return 100.0 * (cur - base) / abs(base)
+
+    wait_gain = [pct_improve_low(float(r["avg_wait_mean"]), base_wait) for r in val_rows]
+    thr_gain = [pct_improve_high(float(r["throughput_mean"]), base_thr) for r in val_rows]
+    fair_gain = [pct_improve_high(float(r["fairness_mean"]), base_fair) for r in val_rows]
+    red_gain = [pct_improve_low(float(r["red_light_violations_mean"]), base_red) for r in val_rows]
+
+    fig, axes = plt.subplots(2, 2, figsize=(11.5, 7.5))
+    series = [
+        (wait_gain, "Avg wait improvement (%)"),
+        (thr_gain, "Throughput improvement (%)"),
+        (fair_gain, "Fairness improvement (%)"),
+        (red_gain, "Red violations improvement (%)"),
+    ]
+    for ax, (vals, title) in zip(axes.flatten(), series):
+        ax.axhline(0.0, color="black", linewidth=1, alpha=0.5)
+        ax.plot(epochs, vals, marker="o")
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        ax.grid(alpha=0.25)
+    fig.suptitle("Validation Improvement Relative to Epoch 1", y=0.99)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(out_path, dpi=180)
+    plt.close(fig)
+    print(f"[plot] {out_path}")
+
+
+def plot_val_distribution(all_val_rows, out_path):
+    by_epoch_wait = {}
+    by_epoch_thr = {}
+    for row in all_val_rows:
+        ep = int(row["epoch"])
+        by_epoch_wait.setdefault(ep, []).append(as_float(row, "avg_wait"))
+        by_epoch_thr.setdefault(ep, []).append(as_float(row, "throughput"))
+    epochs = sorted(by_epoch_wait.keys())
+    if not epochs:
+        return
+
+    wait_data = [by_epoch_wait[e] for e in epochs]
+    thr_data = [by_epoch_thr[e] for e in epochs]
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+    axes[0].boxplot(wait_data, tick_labels=epochs, showmeans=True)
+    axes[0].set_title("Validation avg_wait distribution by epoch")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("avg_wait")
+    axes[0].grid(axis="y", alpha=0.25)
+
+    axes[1].boxplot(thr_data, tick_labels=epochs, showmeans=True)
+    axes[1].set_title("Validation throughput distribution by epoch")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("throughput")
+    axes[1].grid(axis="y", alpha=0.25)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close(fig)
+    print(f"[plot] {out_path}")
+
+
 def add_rl_hyperparams(cmd, args):
     if args.rl_alpha is not None:
         cmd.extend(["--rl-alpha", str(args.rl_alpha)])
@@ -159,14 +326,14 @@ def add_rl_hyperparams(cmd, args):
 def add_rl_reward_params(cmd, args):
     if args.rl_starvation_t is not None:
         cmd.extend(["--rl-starvation-t", str(args.rl_starvation_t)])
-    if args.rl_w_queue_delta is not None:
-        cmd.extend(["--rl-w-queue-delta", str(args.rl_w_queue_delta)])
+    if args.rl_w_throughput is not None:
+        cmd.extend(["--rl-w-throughput", str(args.rl_w_throughput)])
     if args.rl_w_wait_delta is not None:
         cmd.extend(["--rl-w-wait-delta", str(args.rl_w_wait_delta)])
     if args.rl_w_maxwait_delta is not None:
         cmd.extend(["--rl-w-maxwait-delta", str(args.rl_w_maxwait_delta)])
-    if args.rl_w_throughput is not None:
-        cmd.extend(["--rl-w-throughput", str(args.rl_w_throughput)])
+    if args.rl_w_queue_delta is not None:
+        cmd.extend(["--rl-w-queue-delta", str(args.rl_w_queue_delta)])
     if args.rl_w_cur_queue is not None:
         cmd.extend(["--rl-w-cur-queue", str(args.rl_w_cur_queue)])
     if args.rl_w_cur_wait_mass is not None:
@@ -214,16 +381,17 @@ def main():
     parser.add_argument("--rl-epsilon-min", type=float, default=None)
     parser.add_argument("--rl-epsilon-decay", type=float, default=None)
     parser.add_argument("--rl-starvation-t", type=float, default=None)
-    parser.add_argument("--rl-w-queue-delta", type=float, default=None)
-    parser.add_argument("--rl-w-wait-delta", type=float, default=None)
-    parser.add_argument("--rl-w-maxwait-delta", type=float, default=None)
     parser.add_argument("--rl-w-throughput", type=float, default=None)
-    parser.add_argument("--rl-w-cur-queue", type=float, default=None)
-    parser.add_argument("--rl-w-cur-wait-mass", type=float, default=None)
-    parser.add_argument("--rl-w-cur-maxwait", type=float, default=None)
-    parser.add_argument("--rl-w-imbalance", type=float, default=None)
-    parser.add_argument("--rl-w-starved", type=float, default=None)
+    parser.add_argument("--rl-w-wait-delta", type=float, default=None)
     parser.add_argument("--rl-switch-penalty", type=float, default=None)
+    # Legacy reward knobs retained only for backward CLI compatibility.
+    parser.add_argument("--rl-w-maxwait-delta", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--rl-w-queue-delta", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--rl-w-cur-queue", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--rl-w-cur-wait-mass", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--rl-w-cur-maxwait", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--rl-w-imbalance", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--rl-w-starved", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--run-compare", action="store_true")
     parser.add_argument("--compare-modes", default="fixed,greedy,adaptive,random,rl")
     parser.add_argument("--compare-duration", type=int, default=180)
@@ -239,7 +407,9 @@ def main():
     archive_root = Path(args.models_dir) / "epoch_snapshots" / args.study_id
     archive_root.mkdir(parents=True, exist_ok=True)
 
-    epoch_rows = []
+    train_epoch_rows = []
+    val_epoch_rows = []
+    all_train_rows = []
     all_eval_rows = []
 
     for epoch in range(1, args.epochs + 1):
@@ -291,10 +461,20 @@ def main():
         add_rl_reward_params(eval_cmd, args)
         run_cmd(eval_cmd)
 
-        eval_summary = Path(args.results_dir) / eval_exp / "summary.csv"
-        summary = summarize_epoch(eval_summary, epoch)
-        epoch_rows.append(summary)
-        for row in summary["rows"]:
+        train_summary_csv = Path(args.results_dir) / train_exp / "summary.csv"
+        eval_summary_csv = Path(args.results_dir) / eval_exp / "summary.csv"
+
+        train_summary = summarize_split(train_summary_csv, epoch, "train")
+        val_summary = summarize_split(eval_summary_csv, epoch, "validation")
+        train_epoch_rows.append(train_summary)
+        val_epoch_rows.append(val_summary)
+
+        for row in train_summary["rows"]:
+            all_train_rows.append({
+                "epoch": epoch,
+                **row,
+            })
+        for row in val_summary["rows"]:
             all_eval_rows.append({
                 "epoch": epoch,
                 **row,
@@ -302,15 +482,23 @@ def main():
         print(
             "[epoch]",
             epoch,
-            f"val_mean_avg_wait={summary['avg_wait_mean']:.4f}",
-            f"val_mean_throughput={summary['throughput_mean']:.4f}",
-            f"val_mean_red={summary['red_light_violations_mean']:.4f}",
-            f"best_val_run={summary['best_run_id']}",
+            f"train_wait={train_summary['avg_wait_mean']:.4f}",
+            f"val_wait={val_summary['avg_wait_mean']:.4f}",
+            f"train_tp={train_summary['throughput_mean']:.4f}",
+            f"val_tp={val_summary['throughput_mean']:.4f}",
+            f"best_val_run={val_summary['best_run_id']}",
         )
 
+    # Backward compatibility: keep epoch_summary.csv as validation summary.
     epoch_csv = study_dir / "epoch_summary.csv"
-    write_epoch_csv(epoch_csv, epoch_rows)
+    write_epoch_csv(epoch_csv, val_epoch_rows)
     print(f"[out] {epoch_csv}")
+    val_epoch_csv = study_dir / "val_epoch_summary.csv"
+    write_epoch_csv(val_epoch_csv, val_epoch_rows)
+    print(f"[out] {val_epoch_csv}")
+    train_epoch_csv = study_dir / "train_epoch_summary.csv"
+    write_epoch_csv(train_epoch_csv, train_epoch_rows)
+    print(f"[out] {train_epoch_csv}")
 
     all_rows_path = study_dir / "all_val_rows.csv"
     if all_eval_rows:
@@ -321,15 +509,27 @@ def main():
             w.writerows(all_eval_rows)
         print(f"[out] {all_rows_path}")
 
-    plot_epoch_means(epoch_rows, study_dir / "rl_epoch_metrics.png")
-    plot_run_lines(epoch_rows, study_dir / "rl_epoch_run_comparison.png")
+    all_train_rows_path = study_dir / "all_train_rows.csv"
+    if all_train_rows:
+        fields = ["epoch"] + list(all_train_rows[0].keys())[1:]
+        with open(all_train_rows_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            w.writerows(all_train_rows)
+        print(f"[out] {all_train_rows_path}")
 
-        # Select the best EPOCH by validation means, not the single best validation run.
-    if not epoch_rows:
+    plot_epoch_means(val_epoch_rows, study_dir / "rl_epoch_metrics.png")
+    plot_train_val_dashboard(train_epoch_rows, val_epoch_rows, study_dir / "rl_train_val_dashboard.png")
+    plot_improvement_curves(val_epoch_rows, study_dir / "rl_epoch_improvement.png")
+    plot_run_lines(val_epoch_rows, study_dir / "rl_epoch_run_comparison.png")
+    plot_val_distribution(all_eval_rows, study_dir / "rl_val_epoch_boxplots.png")
+
+    # Select the best EPOCH by validation means, not the single best validation run.
+    if not val_epoch_rows:
         raise RuntimeError("no epoch summaries were produced")
 
     ranked_epochs = sorted(
-        epoch_rows,
+        val_epoch_rows,
         key=lambda r: (
             float(r.get("avg_wait_mean", float("inf"))),
             float(r.get("red_light_violations_mean", float("inf"))),
@@ -349,16 +549,23 @@ def main():
     # Keep track of the single best validation run inside the chosen epoch for reference only.
     chosen_epoch_rows = [r for r in all_eval_rows if int(r["epoch"]) == selected_epoch]
     best_run_in_epoch = pick_best_row(chosen_epoch_rows) if chosen_epoch_rows else None
+    selected_train_row = next((r for r in train_epoch_rows if int(r["epoch"]) == selected_epoch), None)
 
     best_meta = {
         "study_id": args.study_id,
         "selected_epoch": selected_epoch,
         "selected_model_path": str(best_src),
-        "selected_epoch_mean_metrics": {
+        "selected_epoch_validation_mean_metrics": {
             "avg_wait_mean": float(best_epoch_row["avg_wait_mean"]),
             "throughput_mean": float(best_epoch_row["throughput_mean"]),
             "fairness_mean": float(best_epoch_row["fairness_mean"]),
             "red_light_violations_mean": float(best_epoch_row["red_light_violations_mean"]),
+        },
+        "selected_epoch_train_mean_metrics": None if selected_train_row is None else {
+            "avg_wait_mean": float(selected_train_row["avg_wait_mean"]),
+            "throughput_mean": float(selected_train_row["throughput_mean"]),
+            "fairness_mean": float(selected_train_row["fairness_mean"]),
+            "red_light_violations_mean": float(selected_train_row["red_light_violations_mean"]),
         },
         "reference_best_run_within_selected_epoch": None if best_run_in_epoch is None else {
             "run_id": best_run_in_epoch["run_id"],

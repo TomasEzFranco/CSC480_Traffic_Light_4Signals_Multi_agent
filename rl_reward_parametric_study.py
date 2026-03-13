@@ -18,6 +18,13 @@ def read_csv_rows(path):
         return list(csv.DictReader(f))
 
 
+def _f(row, key, default):
+    val = row.get(key, "")
+    if val in ("", None):
+        return float(default)
+    return float(val)
+
+
 def run_cmd(cmd):
     print("[cmd]", " ".join(cmd))
     proc = subprocess.run(cmd)
@@ -51,8 +58,8 @@ def run_config(args, config):
         "--rl-epsilon-min", str(args.rl_epsilon_min),
         "--rl-epsilon-decay", str(args.rl_epsilon_decay),
         "--rl-w-throughput", str(config["rl_w_throughput"]),
+        "--rl-w-wait-delta", str(config["rl_w_wait_delta"]),
         "--rl-switch-penalty", str(config["rl_switch_penalty"]),
-        "--rl-w-queue-delta", str(config["rl_w_queue_delta"]),
     ]
     if args.no_log:
         cmd.append("--no-log")
@@ -67,8 +74,8 @@ def run_config(args, config):
             "label": config["label"],
             "legend": config["legend"],
             "rl_w_throughput": config["rl_w_throughput"],
+            "rl_w_wait_delta": config["rl_w_wait_delta"],
             "rl_switch_penalty": config["rl_switch_penalty"],
-            "rl_w_queue_delta": config["rl_w_queue_delta"],
             "epoch": int(float(row["epoch"])),
             "avg_wait_mean": float(row["avg_wait_mean"]),
             "throughput_mean": float(row["throughput_mean"]),
@@ -85,8 +92,8 @@ def write_combined_csv(path, rows):
         "label",
         "legend",
         "rl_w_throughput",
+        "rl_w_wait_delta",
         "rl_switch_penalty",
-        "rl_w_queue_delta",
         "epoch",
         "avg_wait_mean",
         "throughput_mean",
@@ -125,8 +132,8 @@ def write_best_csv(path, rows):
         "label",
         "legend",
         "rl_w_throughput",
+        "rl_w_wait_delta",
         "rl_switch_penalty",
-        "rl_w_queue_delta",
         "epoch",
         "avg_wait_mean",
         "throughput_mean",
@@ -194,7 +201,7 @@ def plot_epoch_lines(rows, out_path):
         ax.grid(alpha=0.28)
     handles, labels = axes[0][0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=2, frameon=True, fontsize=9)
-    fig.suptitle("RL Reward Parametric Study (Throughput Reward vs Switch Penalty)", fontsize=14, y=0.99)
+    fig.suptitle("RL Reward Parametric Study (Throughput/Wait Delta vs Switch Penalty)", fontsize=14, y=0.99)
     plt.tight_layout(rect=[0, 0.0, 1, 0.92])
     plt.savefig(out_path, dpi=220)
     plt.close(fig)
@@ -251,31 +258,31 @@ def main():
     configs = [
         {
             "label": "baseline",
-            "legend": "Baseline  TP=0.75  SW=0.35",
-            "rl_w_throughput": 0.75,
-            "rl_switch_penalty": 0.35,
-            "rl_w_queue_delta": 1.30,
-        },
-        {
-            "label": "tp1p00_sw0p20",
-            "legend": "TP boost  TP=1.00  SW=0.20",
+            "legend": "Baseline  TP=1.00  Wd=0.050  SW=0.20",
             "rl_w_throughput": 1.00,
+            "rl_w_wait_delta": 0.050,
             "rl_switch_penalty": 0.20,
-            "rl_w_queue_delta": 1.30,
         },
         {
-            "label": "tp1p25_sw0p10",
-            "legend": "TP boost+  TP=1.25  SW=0.10",
+            "label": "queue_focus",
+            "legend": "Throughput focus  TP=1.25  Wd=0.040  SW=0.20",
             "rl_w_throughput": 1.25,
-            "rl_switch_penalty": 0.10,
-            "rl_w_queue_delta": 1.30,
+            "rl_w_wait_delta": 0.040,
+            "rl_switch_penalty": 0.20,
         },
         {
-            "label": "tp1p50_sw0p00",
-            "legend": "Aggressive TP  TP=1.50  SW=0.00",
-            "rl_w_throughput": 1.50,
-            "rl_switch_penalty": 0.00,
-            "rl_w_queue_delta": 1.30,
+            "label": "wait_focus",
+            "legend": "Wait focus  TP=0.75  Wd=0.070  SW=0.20",
+            "rl_w_throughput": 0.75,
+            "rl_w_wait_delta": 0.070,
+            "rl_switch_penalty": 0.20,
+        },
+        {
+            "label": "low_switch_penalty",
+            "legend": "Low switch cost  TP=1.00  Wd=0.050  SW=0.10",
+            "rl_w_throughput": 1.00,
+            "rl_w_wait_delta": 0.050,
+            "rl_switch_penalty": 0.10,
         },
     ]
 
@@ -290,9 +297,9 @@ def main():
                 "study_id": row["study_id"],
                 "label": row["label"],
                 "legend": row["legend"],
-                "rl_w_throughput": float(row["rl_w_throughput"]),
-                "rl_switch_penalty": float(row["rl_switch_penalty"]),
-                "rl_w_queue_delta": float(row["rl_w_queue_delta"]),
+                "rl_w_throughput": _f(row, "rl_w_throughput", _f(row, "rl_w_queue_delta", 1.00)),
+                "rl_w_wait_delta": _f(row, "rl_w_wait_delta", 0.050),
+                "rl_switch_penalty": _f(row, "rl_switch_penalty", 0.20),
                 "epoch": int(float(row["epoch"])),
                 "avg_wait_mean": float(row["avg_wait_mean"]),
                 "throughput_mean": float(row["throughput_mean"]),
@@ -306,7 +313,7 @@ def main():
         for cfg in configs:
             print(
                 f"[config] {cfg['legend']} "
-                f"(w_throughput={cfg['rl_w_throughput']}, switch_penalty={cfg['rl_switch_penalty']})"
+                f"(w_throughput={cfg['rl_w_throughput']}, w_wait_delta={cfg['rl_w_wait_delta']}, switch_penalty={cfg['rl_switch_penalty']})"
             )
             all_rows.extend(run_config(args, cfg))
         write_combined_csv(combined_csv, all_rows)

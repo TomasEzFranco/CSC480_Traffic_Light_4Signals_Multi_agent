@@ -26,7 +26,7 @@ python3 -m pip install -r requirements.txt
 
 We tune RL hyperparameters first because tabular Q-learning is sensitive to reward scaling and switch penalties.
 
-- Better reward balance can reduce avg wait without collapsing throughput.
+- Better balance across throughput gain, wait reduction, and switch cost can reduce avg wait.
 - A short sweep is much cheaper than running a full 40-epoch study repeatedly.
 - It makes the final long run defensible: we pre-select one config on validation only, then lock it.
 
@@ -58,7 +58,7 @@ Extract these artifacts:
 - `results/rl_param_sweep_40_53_v1/combined_epoch_metrics.csv`: every epoch for every config.
 - `results/rl_param_sweep_40_53_v1/best_config_by_validation.csv`: best epoch per config using validation metrics.
 - `results/rl_param_sweep_40_53_v1/reward_sweep_epoch_dashboard.png`: learning curves.
-- `results/rl_param_sweep_40_53_v1/reward_sweep_best_tradeoff.png`: wait/throughput frontier.
+- `results/rl_param_sweep_40_53_v1/reward_sweep_best_tradeoff.png`: wait/throughput frontier across reward presets.
 
 What to pick from the sweep:
 
@@ -66,7 +66,7 @@ What to pick from the sweep:
 - Lowest `avg_wait_mean`
 - Tie-breaker: lowest `red_light_violations_mean`
 - Tie-breaker: highest `throughput_mean`
-- Copy the selected values for `--rl-w-throughput`, `--rl-switch-penalty`, and `--rl-w-queue-delta`.
+- Copy the selected values for `--rl-w-throughput`, `--rl-w-wait-delta`, and `--rl-switch-penalty`.
 
 ## 6. RL Full Epoch Study (Long Run for Best RL Model)
 
@@ -89,9 +89,9 @@ python3 rl_epoch_study.py \
   --duration-eval 180 \
   --compare-duration 180 \
   --dt 0.0166667 \
-  --rl-w-throughput 1.25 \
-  --rl-switch-penalty 0.10 \
-  --rl-w-queue-delta 1.30 \
+  --rl-w-throughput 1.00 \
+  --rl-w-wait-delta 0.050 \
+  --rl-switch-penalty 0.20 \
   --model-path models/studies/rl_split_40_53_v1/shared_qtable.json \
   --best-model-output models/rl_best_split_40_53_v1.json \
   --run-compare
@@ -99,12 +99,35 @@ python3 rl_epoch_study.py \
 
 Key outputs:
 - `results/rl_split_40_53_v1/epoch_summary.csv`
+- `results/rl_split_40_53_v1/val_epoch_summary.csv`
+- `results/rl_split_40_53_v1/train_epoch_summary.csv`
 - `results/rl_split_40_53_v1/all_val_rows.csv`
+- `results/rl_split_40_53_v1/all_train_rows.csv`
 - `results/rl_split_40_53_v1/rl_epoch_metrics.png`
+- `results/rl_split_40_53_v1/rl_train_val_dashboard.png`
+- `results/rl_split_40_53_v1/rl_epoch_improvement.png`
 - `results/rl_split_40_53_v1/rl_epoch_run_comparison.png`
+- `results/rl_split_40_53_v1/rl_val_epoch_boxplots.png`
 - `results/rl_split_40_53_v1/best_rl_selection.json`
 - `models/rl_best_split_40_53_v1.json`
 - `results/rl_split_40_53_v1_compare_best/summary.csv`
+
+### Simpler one-command RL workflow
+
+Use this wrapper when you want the same train/val/test protocol with far fewer flags:
+
+```bash
+python3 rl_simple_study.py \
+  --study-id rl_simple_40_53_v1 \
+  --epochs 20
+```
+
+Defaults used by `rl_simple_study.py`:
+- seeds: train `40-47`, val `48-50`, test `51-53`
+- spawn rate: `2.0`
+- reward: `w_throughput=1.00`, `w_wait_delta=0.050`, `switch_penalty=0.20`
+- durations: train `300s`, eval `180s`, compare `180s`
+- runs holdout compare automatically (use `--skip-compare` to disable)
 
 ## 7. RL Holdout Compare Graphs
 
@@ -207,7 +230,7 @@ python3 simulation.py \
   --spawn-rate 1.0 \
   --duration 90 \
   --dt 0.0166667 \
-  --fixed-green-seconds 9 \
+  --fixed-green-seconds 3 \
   --shared-green-seconds 3
 ```
 
@@ -219,7 +242,7 @@ python3 simulation.py \
   --spawn-rate 1.0 \
   --duration 90 \
   --dt 0.0166667 \
-  --fixed-green-seconds 9 \
+  --fixed-green-seconds 3 \
   --shared-green-seconds 3 \
   --rl-model-path models/rl_best_split_40_53_v1.json
 ```
