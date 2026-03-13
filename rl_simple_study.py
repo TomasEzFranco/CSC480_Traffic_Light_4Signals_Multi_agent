@@ -34,10 +34,21 @@ def main():
     parser.add_argument("--model-path", default="")
     parser.add_argument("--best-model-output", default="")
     parser.add_argument("--rl-alpha", type=float, default=None)
+    parser.add_argument(
+        "--rl-alpha-schedule",
+        default="",
+        help="Optional epoch-based alpha schedule, e.g. '1-4:0.2,5-6:0.14,7+:0.10'.",
+    )
     parser.add_argument("--rl-gamma", type=float, default=None)
     parser.add_argument("--rl-epsilon", type=float, default=None)
     parser.add_argument("--rl-epsilon-min", type=float, default=None)
     parser.add_argument("--rl-epsilon-decay", type=float, default=None)
+    parser.add_argument(
+        "--rl-state-profile",
+        choices=["coarse", "default", "fine"],
+        default="fine",
+        help="RL state bucket profile. Default is 'fine' for higher state resolution.",
+    )
     parser.add_argument("--rl-w-throughput", type=float, default=1.00)
     parser.add_argument("--rl-w-wait-delta", type=float, default=0.050)
     parser.add_argument("--rl-switch-penalty", type=float, default=0.20)
@@ -96,10 +107,13 @@ def main():
         str(args.rl_switch_penalty),
     ]
     add_optional(cmd, "--rl-alpha", args.rl_alpha)
+    if args.rl_alpha_schedule.strip():
+        cmd.extend(["--rl-alpha-schedule", args.rl_alpha_schedule.strip()])
     add_optional(cmd, "--rl-gamma", args.rl_gamma)
     add_optional(cmd, "--rl-epsilon", args.rl_epsilon)
     add_optional(cmd, "--rl-epsilon-min", args.rl_epsilon_min)
     add_optional(cmd, "--rl-epsilon-decay", args.rl_epsilon_decay)
+    add_optional(cmd, "--rl-state-profile", args.rl_state_profile)
     if args.no_log:
         cmd.append("--no-log")
     if not args.skip_compare:

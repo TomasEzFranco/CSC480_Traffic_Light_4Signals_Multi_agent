@@ -26,6 +26,7 @@ def parse_float_list(raw):
 def run_one(py_cmd, mode, seed, spawn_rate, duration, dt, results_dir, exp_id,
             no_log, rl_model_path, rl_train, rl_alpha, rl_gamma,
             rl_epsilon, rl_epsilon_min, rl_epsilon_decay,
+            rl_state_profile,
             rl_starvation_t, rl_w_queue_delta, rl_w_wait_delta, rl_w_maxwait_delta,
             rl_w_throughput, rl_w_cur_queue, rl_w_cur_wait_mass, rl_w_cur_maxwait,
             rl_w_imbalance, rl_w_starved, rl_switch_penalty,
@@ -67,6 +68,8 @@ def run_one(py_cmd, mode, seed, spawn_rate, duration, dt, results_dir, exp_id,
             cmd.extend(["--rl-epsilon-min", str(rl_epsilon_min)])
         if rl_epsilon_decay is not None:
             cmd.extend(["--rl-epsilon-decay", str(rl_epsilon_decay)])
+        if rl_state_profile is not None:
+            cmd.extend(["--rl-state-profile", str(rl_state_profile)])
         if rl_starvation_t is not None:
             cmd.extend(["--rl-starvation-t", str(rl_starvation_t)])
         if rl_w_queue_delta is not None:
@@ -284,6 +287,12 @@ def main():
     parser.add_argument("--rl-epsilon", type=float, default=None)
     parser.add_argument("--rl-epsilon-min", type=float, default=None)
     parser.add_argument("--rl-epsilon-decay", type=float, default=None)
+    parser.add_argument(
+        "--rl-state-profile",
+        choices=["coarse", "default", "fine"],
+        default=None,
+        help="RL tabular state bucket profile passed to simulation.py.",
+    )
     parser.add_argument("--rl-starvation-t", type=float, default=None)
     parser.add_argument("--rl-w-throughput", type=float, default=None)
     parser.add_argument("--rl-w-wait-delta", type=float, default=None)
@@ -377,6 +386,7 @@ def main():
             args.rl_epsilon,
             args.rl_epsilon_min,
             args.rl_epsilon_decay,
+            args.rl_state_profile,
             args.rl_starvation_t,
             args.rl_w_queue_delta,
             args.rl_w_wait_delta,

@@ -183,8 +183,13 @@ python run_experiments.py --modes rl --seeds 31,32,33,34,35 --spawn-rates 1.0 --
 ## Run epoch study
 
 ```bash
-python rl_epoch_study.py --study-id rl_shared_protocol_test_v3 --epochs 3 --train-seeds 21,22,23,24,25,26,27,28,29,30 --val-seeds 31,32,33,34,35 --test-seeds 41,42,43,44,45 --spawn-rates 1.0 --duration-train 300 --duration-eval 180 --compare-duration 180 --model-path models/rl_shared_epoch.json --best-model-output models/rl_best_shared.json --run-compare
+python rl_epoch_study.py --study-id rl_shared_protocol_test_v3 --epochs 3 --train-seeds 21,22,23,24,25,26,27,28,29,30 --val-seeds 31,32,33,34,35 --test-seeds 41,42,43,44,45 --spawn-rates 1.0 --duration-train 300 --duration-eval 180 --compare-duration 180 --model-path models/rl_shared_epoch.json --best-model-output models/rl_best_shared.json --rl-state-profile fine --run-compare
 ```
+
+State-profile note for RL:
+
+* `--rl-state-profile coarse|default|fine` controls queue/wait bucket granularity in the Q-table state.
+* Use `fine` for longer studies when you want higher state resolution.
 
 ---
 

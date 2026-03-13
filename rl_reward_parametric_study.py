@@ -57,6 +57,7 @@ def run_config(args, config):
         "--rl-epsilon", str(args.rl_epsilon),
         "--rl-epsilon-min", str(args.rl_epsilon_min),
         "--rl-epsilon-decay", str(args.rl_epsilon_decay),
+        "--rl-state-profile", args.rl_state_profile,
         "--rl-w-throughput", str(config["rl_w_throughput"]),
         "--rl-w-wait-delta", str(config["rl_w_wait_delta"]),
         "--rl-switch-penalty", str(config["rl_switch_penalty"]),
@@ -247,6 +248,12 @@ def main():
     parser.add_argument("--rl-epsilon", type=float, default=0.20)
     parser.add_argument("--rl-epsilon-min", type=float, default=0.02)
     parser.add_argument("--rl-epsilon-decay", type=float, default=0.9995)
+    parser.add_argument(
+        "--rl-state-profile",
+        choices=["coarse", "default", "fine"],
+        default="fine",
+        help="RL state bucket profile to use during each reward-config run.",
+    )
     parser.add_argument("--no-log", action="store_true")
     parser.add_argument(
         "--reuse-existing",

@@ -50,6 +50,7 @@ python3 rl_reward_parametric_study.py \
   --rl-epsilon 0.20 \
   --rl-epsilon-min 0.02 \
   --rl-epsilon-decay 0.9995 \
+  --rl-state-profile fine \
   --no-log
 ```
 
@@ -92,6 +93,7 @@ python3 rl_epoch_study.py \
   --rl-w-throughput 1.00 \
   --rl-w-wait-delta 0.050 \
   --rl-switch-penalty 0.20 \
+  --rl-state-profile fine \
   --model-path models/studies/rl_split_40_53_v1/shared_qtable.json \
   --best-model-output models/rl_best_split_40_53_v1.json \
   --run-compare
@@ -112,6 +114,26 @@ Key outputs:
 - `models/rl_best_split_40_53_v1.json`
 - `results/rl_split_40_53_v1_compare_best/summary.csv`
 
+### RL state bucket profiles (new)
+
+Tabular RL now supports:
+- `--rl-state-profile coarse`
+- `--rl-state-profile default`
+- `--rl-state-profile fine`
+
+State tuple is unchanged:
+- `(cur_phase, dom_q, dom_wait, q_bucket, max_wait_bucket)`
+
+Approx table sizes:
+- `coarse`: `4*4*4*7*7 = 3,136` states
+- `default`: `4*4*4*8*8 = 4,096` states
+- `fine`: `4*4*4*12*12 = 9,216` states
+
+Practical guidance:
+- use `fine` for your longer studies when you want more sensitivity to queue/wait changes
+- use `default` for quick smoke runs
+- use `coarse` only when you need faster, rougher convergence
+
 ### Simpler one-command RL workflow
 
 Use this wrapper when you want the same train/val/test protocol with far fewer flags:
@@ -126,8 +148,18 @@ Defaults used by `rl_simple_study.py`:
 - seeds: train `40-47`, val `48-50`, test `51-53`
 - spawn rate: `2.0`
 - reward: `w_throughput=1.00`, `w_wait_delta=0.050`, `switch_penalty=0.20`
+- state profile: `fine`
 - durations: train `300s`, eval `180s`, compare `180s`
 - runs holdout compare automatically (use `--skip-compare` to disable)
+
+Concrete alpha schedule for an 8-epoch run:
+
+```bash
+python3 rl_simple_study.py \
+  --study-id rl_simple_sched_8e \
+  --epochs 8 \
+  --rl-alpha-schedule "1-4:0.2,5-6:0.14,7+:0.10"
+```
 
 ## 7. RL Holdout Compare Graphs
 

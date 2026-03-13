@@ -45,6 +45,9 @@ and
 
 Each of these folders contains a `summary.csv` file.
 
+For RL fairness, keep one fixed state profile across all budgets (recommended: `--rl-state-profile fine`).
+Mixing `coarse/default/fine` between budgets changes the Q-table size and makes the budget comparison less clean.
+
 Those `summary.csv` files store the final evaluation results for that model after training with the given time budget.
 
 For example:

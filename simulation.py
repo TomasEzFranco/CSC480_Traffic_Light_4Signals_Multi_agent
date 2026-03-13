@@ -43,6 +43,12 @@ parser.add_argument("--rl-gamma", type=float, default=0.95)
 parser.add_argument("--rl-epsilon", type=float, default=0.20)
 parser.add_argument("--rl-epsilon-min", type=float, default=0.02)
 parser.add_argument("--rl-epsilon-decay", type=float, default=0.9995)
+parser.add_argument(
+    "--rl-state-profile",
+    choices=["coarse", "default", "fine"],
+    default="default",
+    help="State bucket granularity for tabular RL.",
+)
 parser.add_argument("--rl-starvation-t", type=float, default=None)
 parser.add_argument(
     "--rl-w-throughput",
@@ -144,6 +150,23 @@ class Config:
     RL_EPSILON       = args.rl_epsilon
     RL_EPSILON_MIN   = args.rl_epsilon_min
     RL_EPSILON_DECAY = args.rl_epsilon_decay
+    RL_STATE_PROFILE = args.rl_state_profile
+    _RL_STATE_BUCKETS = {
+        # Coarser bins: fewer states, faster coverage, less precision.
+        "coarse": {"q_width": 6, "q_cap": 6, "wait_width": 14, "wait_cap": 6},
+        # Existing behavior before this profile setting was added.
+        "default": {"q_width": 4, "q_cap": 7, "wait_width": 10, "wait_cap": 7},
+        # Finer bins: more states, better resolution, needs more experience.
+        "fine": {"q_width": 2, "q_cap": 11, "wait_width": 5, "wait_cap": 11},
+    }
+    _RL_BUCKET_CFG = _RL_STATE_BUCKETS[RL_STATE_PROFILE]
+    RL_Q_BUCKET_WIDTH = _RL_BUCKET_CFG["q_width"]
+    RL_Q_BUCKET_CAP = _RL_BUCKET_CFG["q_cap"]
+    RL_MAX_WAIT_BUCKET_WIDTH = _RL_BUCKET_CFG["wait_width"]
+    RL_MAX_WAIT_BUCKET_CAP = _RL_BUCKET_CFG["wait_cap"]
+    RL_STATE_TABLE_SIZE = (
+        4 * 4 * 4 * (RL_Q_BUCKET_CAP + 1) * (RL_MAX_WAIT_BUCKET_CAP + 1)
+    )
     RL_STARVATION_T  = args.rl_starvation_t if args.rl_starvation_t is not None else 35.0
     # Simplified RL reward: throughput increase + wait reduction - switch penalty.
     RL_W_THROUGHPUT = (
@@ -286,6 +309,12 @@ class RunArtifacts:
                 "rl_epsilon": C.RL_EPSILON,
                 "rl_epsilon_min": C.RL_EPSILON_MIN,
                 "rl_epsilon_decay": C.RL_EPSILON_DECAY,
+                "rl_state_profile": C.RL_STATE_PROFILE,
+                "rl_q_bucket_width": C.RL_Q_BUCKET_WIDTH,
+                "rl_q_bucket_cap": C.RL_Q_BUCKET_CAP,
+                "rl_max_wait_bucket_width": C.RL_MAX_WAIT_BUCKET_WIDTH,
+                "rl_max_wait_bucket_cap": C.RL_MAX_WAIT_BUCKET_CAP,
+                "rl_state_table_size": C.RL_STATE_TABLE_SIZE,
                 "rl_starvation_t": C.RL_STARVATION_T,
                 "rl_reward_mode": "throughput_wait_switch",
                 "rl_w_throughput": C.RL_W_THROUGHPUT,
@@ -857,15 +886,15 @@ class RandomController(SignalController):
 
 class RLController(SignalController):
     """
-    Pressure- and delay-aware Q-learning controller.
+    Compact tabular Q-learning controller.
 
-    Improvements over the original version:
-      - richer tabular state with queue, wait, pressure, and starvation summary
-      - heuristic-prior Q initialisation for unseen states
-      - simplified shaped reward based on throughput increase, wait reduction,
-        and switch cost
-      - explicit option to keep the current phase by selecting the same phase
-        again when green expires (handled in SimState._step_signals_one_second)
+    Current state intentionally uses a compact set of coarse features to keep
+    the table small and speed up learning:
+      - current phase
+      - dominant queue direction
+      - dominant wait direction
+      - total queue bucket
+      - max wait bucket
     """
     def __init__(self, iid):
         super().__init__(iid)
@@ -940,23 +969,18 @@ class RLController(SignalController):
         }
 
     def _state(self, m):
-        q_bucket = min(m["total_q"] // 4, 7)
-        max_wait_bucket = min(int(m["max_wait"] // 10), 7)
-        imbalance_bucket = min(int(m["imbalance"] // 2), 5)
+        q_bucket = min(int(m["total_q"] // C.RL_Q_BUCKET_WIDTH), C.RL_Q_BUCKET_CAP)
+        max_wait_bucket = min(
+            int(m["max_wait"] // C.RL_MAX_WAIT_BUCKET_WIDTH),
+            C.RL_MAX_WAIT_BUCKET_CAP,
+        )
         cur_phase = m["cur_phase"]
-        cur_q_bucket = min(m["queues"][cur_phase] // 3, 5)
-        cur_wait_bucket = min(int(m["avg_waits"][cur_phase] // 8), 7)
         return (
             cur_phase,
             m["dom_q"],
             m["dom_wait"],
-            m["dom_pressure"],
             q_bucket,
             max_wait_bucket,
-            imbalance_bucket,
-            m["starved_dir"],
-            cur_q_bucket,
-            cur_wait_bucket,
         )
 
     def _prior_values(self, m):
@@ -1744,6 +1768,8 @@ class SimState:
                 "training": C.RL_TRAIN,
                 "epsilon": (RL_POLICY.epsilon if RL_POLICY is not None else None),
                 "updates": (RL_POLICY.updates if RL_POLICY is not None else 0),
+                "state_profile": C.RL_STATE_PROFILE,
+                "state_table_size": C.RL_STATE_TABLE_SIZE,
             },
             "neural": {
                 "model_path": C.NEURAL_MODEL_PATH,
@@ -2200,7 +2226,10 @@ def main():
               f"spawn_rate={C.SPAWN_RATE}  duration={C.DURATION}s  "
               f"dt={C.FIXED_DT:.4f}s  out={artifacts.run_dir}")
         if C.CONTROL_MODE == "rl":
-            print(f"[RL] train={C.RL_TRAIN} model={C.RL_MODEL_PATH}")
+            print(
+                f"[RL] train={C.RL_TRAIN} model={C.RL_MODEL_PATH} "
+                f"state_profile={C.RL_STATE_PROFILE} states~{C.RL_STATE_TABLE_SIZE}"
+            )
         if C.CONTROL_MODE == "neural":
             print(f"[NEURAL] model={C.NEURAL_MODEL_PATH}")
         if C.COLLECT_NEURAL_DATA:

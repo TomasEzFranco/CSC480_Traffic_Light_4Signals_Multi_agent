@@ -28,6 +28,59 @@ def parse_float_list(raw):
     return [float(x.strip()) for x in raw.split(",") if x.strip()]
 
 
+def parse_alpha_schedule(raw):
+    """
+    Parse epoch->alpha schedule text.
+    Supported forms per segment (comma-separated):
+      - N-M:V   (inclusive range)
+      - N+:V    (N to infinity)
+      - N-:V    (same as N+:V)
+      - N:V     (single epoch)
+    Example: "1-4:0.2,5-6:0.14,7+:0.10"
+    Returns list of (start_epoch, end_epoch_or_None, alpha).
+    """
+    schedule = []
+    text = (raw or "").strip()
+    if not text:
+        return schedule
+
+    for seg in [s.strip() for s in text.split(",") if s.strip()]:
+        if ":" not in seg:
+            raise ValueError(f"invalid alpha schedule segment (missing ':'): {seg}")
+        rng, val_raw = seg.split(":", 1)
+        alpha_val = float(val_raw.strip())
+        rng = rng.strip()
+        if not rng:
+            raise ValueError(f"invalid alpha schedule segment (empty epoch range): {seg}")
+
+        if rng.endswith("+"):
+            start = int(rng[:-1].strip())
+            end = None
+        elif "-" in rng:
+            left, right = rng.split("-", 1)
+            start = int(left.strip())
+            right = right.strip()
+            end = None if right == "" else int(right)
+        else:
+            start = int(rng)
+            end = start
+
+        if start < 1:
+            raise ValueError(f"alpha schedule start epoch must be >= 1: {seg}")
+        if end is not None and end < start:
+            raise ValueError(f"alpha schedule end epoch must be >= start: {seg}")
+        schedule.append((start, end, alpha_val))
+
+    return schedule
+
+
+def alpha_for_epoch(epoch, base_alpha, schedule):
+    for start, end, alpha in schedule:
+        if epoch >= start and (end is None or epoch <= end):
+            return alpha
+    return base_alpha
+
+
 def run_cmd(cmd):
     print("[cmd]", " ".join(cmd))
     proc = subprocess.run(cmd)
@@ -310,9 +363,10 @@ def plot_val_distribution(all_val_rows, out_path):
     print(f"[plot] {out_path}")
 
 
-def add_rl_hyperparams(cmd, args):
-    if args.rl_alpha is not None:
-        cmd.extend(["--rl-alpha", str(args.rl_alpha)])
+def add_rl_hyperparams(cmd, args, alpha_override=None):
+    epoch_alpha = alpha_override if alpha_override is not None else args.rl_alpha
+    if epoch_alpha is not None:
+        cmd.extend(["--rl-alpha", str(epoch_alpha)])
     if args.rl_gamma is not None:
         cmd.extend(["--rl-gamma", str(args.rl_gamma)])
     if args.rl_epsilon is not None:
@@ -321,6 +375,8 @@ def add_rl_hyperparams(cmd, args):
         cmd.extend(["--rl-epsilon-min", str(args.rl_epsilon_min)])
     if args.rl_epsilon_decay is not None:
         cmd.extend(["--rl-epsilon-decay", str(args.rl_epsilon_decay)])
+    if args.rl_state_profile is not None:
+        cmd.extend(["--rl-state-profile", str(args.rl_state_profile)])
 
 
 def add_rl_reward_params(cmd, args):
@@ -376,10 +432,21 @@ def main():
         help="Best selected model copy target.",
     )
     parser.add_argument("--rl-alpha", type=float, default=None)
+    parser.add_argument(
+        "--rl-alpha-schedule",
+        default="",
+        help="Optional epoch-based alpha schedule, e.g. '1-4:0.2,5-6:0.14,7+:0.10'.",
+    )
     parser.add_argument("--rl-gamma", type=float, default=None)
     parser.add_argument("--rl-epsilon", type=float, default=None)
     parser.add_argument("--rl-epsilon-min", type=float, default=None)
     parser.add_argument("--rl-epsilon-decay", type=float, default=None)
+    parser.add_argument(
+        "--rl-state-profile",
+        choices=["coarse", "default", "fine"],
+        default=None,
+        help="RL tabular state bucket profile passed through to simulation.py.",
+    )
     parser.add_argument("--rl-starvation-t", type=float, default=None)
     parser.add_argument("--rl-w-throughput", type=float, default=None)
     parser.add_argument("--rl-w-wait-delta", type=float, default=None)
@@ -401,6 +468,7 @@ def main():
     val_seeds = parse_int_list(args.val_seeds)
     test_seeds = parse_int_list(args.test_seeds)
     spawns = parse_float_list(args.spawn_rates)
+    alpha_schedule = parse_alpha_schedule(args.rl_alpha_schedule)
 
     study_dir = Path(args.results_dir) / args.study_id
     study_dir.mkdir(parents=True, exist_ok=True)
@@ -417,6 +485,7 @@ def main():
         train_exp = f"{args.study_id}_train_e{ep}"
         eval_exp = f"{args.study_id}_val_e{ep}"
         snapshot_path = archive_root / f"epoch_{ep}.json"
+        epoch_alpha = alpha_for_epoch(epoch, args.rl_alpha, alpha_schedule)
 
         train_cmd = [
             args.python,
@@ -433,7 +502,7 @@ def main():
         ]
         if args.no_log:
             train_cmd.append("--no-log")
-        add_rl_hyperparams(train_cmd, args)
+        add_rl_hyperparams(train_cmd, args, alpha_override=epoch_alpha)
         add_rl_reward_params(train_cmd, args)
         run_cmd(train_cmd)
 
@@ -457,7 +526,7 @@ def main():
         ]
         if args.no_log:
             eval_cmd.append("--no-log")
-        add_rl_hyperparams(eval_cmd, args)
+        add_rl_hyperparams(eval_cmd, args, alpha_override=epoch_alpha)
         add_rl_reward_params(eval_cmd, args)
         run_cmd(eval_cmd)
 
@@ -486,6 +555,7 @@ def main():
             f"val_wait={val_summary['avg_wait_mean']:.4f}",
             f"train_tp={train_summary['throughput_mean']:.4f}",
             f"val_tp={val_summary['throughput_mean']:.4f}",
+            f"alpha={epoch_alpha if epoch_alpha is not None else 'default'}",
             f"best_val_run={val_summary['best_run_id']}",
         )
 

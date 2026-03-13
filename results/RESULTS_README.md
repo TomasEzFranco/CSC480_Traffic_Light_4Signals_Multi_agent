@@ -25,6 +25,21 @@ Typical modes included are:
 
 ---
 
+## RL metadata note (new)
+
+For RL runs, each run folder's `config.json` now records:
+
+- `rl_state_profile`
+- `rl_q_bucket_width`
+- `rl_q_bucket_cap`
+- `rl_max_wait_bucket_width`
+- `rl_max_wait_bucket_cap`
+- `rl_state_table_size`
+
+Use these fields to confirm RL comparisons were done with the same bucket granularity.
+
+---
+
 ## 2. Folder: `results/final_main_comparison_hybrid_v3/plots`
 
 This folder contains the standard performance plots.

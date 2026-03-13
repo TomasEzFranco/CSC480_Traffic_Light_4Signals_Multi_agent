@@ -54,3 +54,23 @@ Mihir Gandhi - [mihir-m-gandhi](https://github.com/mihir-m-gandhi)
 This project is licensed under the MIT - see the [LICENSE](./LICENSE) file for details.
 
 You can naviagte through the simulation using the a, s, w, and d keys. This will let you look at the different intersections.
+
+### RL State Bucket Profiles
+
+For tabular RL (`--mode rl`), you can control state discretization with:
+
+- `--rl-state-profile coarse`
+- `--rl-state-profile default`
+- `--rl-state-profile fine`
+
+The RL state remains:
+
+- `(cur_phase, dom_q, dom_wait, q_bucket, max_wait_bucket)`
+
+Only the queue/wait bucket granularity changes. `fine` gives more resolution (more states), while `coarse` is faster but less precise.
+
+Example headless RL train run with finer buckets:
+
+```bash
+python simulation.py --headless --mode rl --rl-train --seed 42 --spawn-rate 2.0 --duration 300 --rl-state-profile fine
+```
