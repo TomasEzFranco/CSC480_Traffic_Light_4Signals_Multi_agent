@@ -1,0 +1,30 @@
+{
+  "study_id": "final_final_results_train10",
+  "selected_epoch": 1,
+  "selected_model_path": "models\\epoch_snapshots\\final_final_results_train10\\epoch_001.json",
+  "selected_epoch_validation_mean_metrics": {
+    "avg_wait_mean": 12.631134324286943,
+    "throughput_mean": 148.99970200058405,
+    "fairness_mean": 0.7511956464205826,
+    "red_light_violations_mean": 0.0
+  },
+  "selected_epoch_train_mean_metrics": {
+    "avg_wait_mean": 20.667392259746343,
+    "throughput_mean": 156.19968760064955,
+    "fairness_mean": 0.7359985728824736,
+    "red_light_violations_mean": 0.0
+  },
+  "reference_best_run_within_selected_epoch": {
+    "run_id": "rl_seed48_spawn2p00",
+    "avg_wait": 11.900907265344102,
+    "throughput": 149.333034667252,
+    "fairness": 0.8866026036354436,
+    "red_light_violations": 0.0
+  },
+  "best_model_output": "models\\rl_best_final_final_results.json",
+  "selection_rule": [
+    "lowest validation mean avg_wait across all validation seeds",
+    "then lowest validation mean red_light_violations",
+    "then highest validation mean throughput"
+  ]
+}
