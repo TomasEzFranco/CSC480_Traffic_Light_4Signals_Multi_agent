@@ -1,0 +1,30 @@
+{
+  "study_id": "pres2_sw010_ws12_20260313",
+  "selected_epoch": 2,
+  "selected_model_path": "models\\epoch_snapshots\\pres2_sw010_ws12_20260313\\epoch_002.json",
+  "selected_epoch_validation_mean_metrics": {
+    "avg_wait_mean": 11.671489214948416,
+    "throughput_mean": 152.3330286672638,
+    "fairness_mean": 0.7941220914275028,
+    "red_light_violations_mean": 0.0
+  },
+  "selected_epoch_train_mean_metrics": {
+    "avg_wait_mean": 13.674420322470107,
+    "throughput_mean": 159.47468105066318,
+    "fairness_mean": 0.7921659581524519,
+    "red_light_violations_mean": 0.0
+  },
+  "reference_best_run_within_selected_epoch": {
+    "run_id": "rl_seed48_spawn2p00",
+    "avg_wait": 11.023331312841371,
+    "throughput": 149.66636733392,
+    "fairness": 0.7704782409628047,
+    "red_light_violations": 0.0
+  },
+  "best_model_output": "models\\rl_best_pres2_sw0p10_ws12_20260313.json",
+  "selection_rule": [
+    "lowest validation mean avg_wait across all validation seeds",
+    "then lowest validation mean red_light_violations",
+    "then highest validation mean throughput"
+  ]
+}

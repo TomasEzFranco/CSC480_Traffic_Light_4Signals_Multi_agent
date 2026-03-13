@@ -1,0 +1,4 @@
+weight,best_epoch,val_avg_wait_mean,val_throughput_mean,val_fairness_mean,val_red_light_violations_mean,best_model_path
+0.10,2,11.671489214948416,152.3330286672638,0.7941220914275028,0.0,models\epoch_snapshots\pres2_sw010_ws12_20260313\epoch_002.json
+0.15,2,11.671489214948416,152.3330286672638,0.7941220914275028,0.0,models\epoch_snapshots\pres2_sw015_ws12_20260313\epoch_002.json
+0.20,2,11.671489214948416,152.3330286672638,0.7941220914275028,0.0,models\epoch_snapshots\pres2_sw020_ws12_20260313\epoch_002.json
